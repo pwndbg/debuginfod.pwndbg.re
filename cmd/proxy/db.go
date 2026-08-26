@@ -26,9 +26,7 @@ func NewDB(ctx context.Context, dsn string) (*dbSrv, error) {
 	if err := conn.Ping(ctx); err != nil {
 		return nil, err
 	}
-	return &dbSrv{
-		conn: conn,
-	}, nil
+	return &dbSrv{conn: conn}, nil
 }
 
 type dbSrv struct {
@@ -85,6 +83,8 @@ ORDER BY (timestamp, buildid);
 CREATE TABLE IF NOT EXISTS access_log (
     timestamp     DateTime DEFAULT now(),  -- when the request was handled
     remote_ip     IPv6,                  -- client IP
+    country       LowCardinality(String),  -- CF-IPCountry, '' unless Cloudflare sends it
+    tags          Array(LowCardinality(String)),  -- classification at write time, e.g. github_actions
     method        LowCardinality(String),                  -- GET / POST / etc.
     endpoint_name        LowCardinality(String),                  -- GET / POST / etc.
     request_uri   String,                  -- request path (e.g. /buildid/abc123/executable)
@@ -143,6 +143,21 @@ ORDER BY timestamp;
 	// apparent_bytes".
 	if err := s.conn.Exec(ctx, `
 ALTER TABLE cache_stats ADD COLUMN IF NOT EXISTS apparent_bytes UInt64 AFTER bytes;
+`); err != nil {
+		return err
+	}
+
+	// Migrations for instances created before request classification existed.
+	// The CREATE TABLE IF NOT EXISTS above is a no-op on them, so without these
+	// the INSERT fails with "No such column tags" - the same way a missing
+	// apparent_bytes once broke cache_stats in production.
+	if err := s.conn.Exec(ctx, `
+ALTER TABLE access_log ADD COLUMN IF NOT EXISTS country LowCardinality(String) AFTER remote_ip;
+`); err != nil {
+		return err
+	}
+	if err := s.conn.Exec(ctx, `
+ALTER TABLE access_log ADD COLUMN IF NOT EXISTS tags Array(LowCardinality(String)) AFTER country;
 `); err != nil {
 		return err
 	}
@@ -272,8 +287,15 @@ type StateHeaders struct {
 }
 
 type AccessLogEntry struct {
-	Timestamp       time.Time
-	RemoteIP        netip.Addr
+	Timestamp time.Time
+	RemoteIP  netip.Addr
+	Country   string
+	// Tags classify the request as it is logged - currently only which GitHub
+	// service the client address belongs to. Written here rather than derived
+	// at query time so a row records what was true when it arrived: GitHub's
+	// actions ranges are Azure allocations that churn, and reading an old row
+	// against today's list would reattribute traffic that predates the change.
+	Tags            []string
 	Method          string
 	EndpointName    string
 	RequestURI      string
@@ -296,7 +318,7 @@ func (s *dbSrv) AccessLog(ctx context.Context, entry AccessLogEntry) error {
 
 	const query = `
 		INSERT INTO access_log 
-		(timestamp, remote_ip, method, endpoint_name, request_uri, status, user_agent, duration_ms, duration_100kb_ms, bytes_sent, buildid, resolved_host, cache_status, error_msg, response_headers)
+		(timestamp, remote_ip, country, tags, method, endpoint_name, request_uri, status, user_agent, duration_ms, duration_100kb_ms, bytes_sent, buildid, resolved_host, cache_status, error_msg, response_headers)
 	`
 	batch, err := s.conn.PrepareBatch(ctx, query)
 	if err != nil {
@@ -306,6 +328,8 @@ func (s *dbSrv) AccessLog(ctx context.Context, entry AccessLogEntry) error {
 	if err := batch.Append(
 		entry.Timestamp,
 		entry.RemoteIP,
+		entry.Country,
+		entry.Tags,
 		entry.Method,
 		entry.EndpointName,
 		entry.RequestURI,

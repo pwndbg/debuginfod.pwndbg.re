@@ -11,13 +11,13 @@ dashboard; lines marked **(external)** are the only record of them.
 Host `host1.cypis.ovh`, deploy root `/persist/debuginfod.pwndbg.re/`.
 All containers use `--network host`, so `EXPOSE` in the Dockerfiles is decorative.
 
-| Service | Address | Container | Source |
-|---|---|---|---|
-| proxy | `127.0.0.1:8031` | `pwndbg-debuginfod-proxy` | `cmd/proxy` |
-| nix backend | `127.0.0.1:8032` | `pwndbg-debuginfod-nix` | `cmd/nix-nar-old`, one upstream among the others |
-| releases | `127.0.0.1:8033` | `pwndbg-debuginfod-releases` | `cmd/releases`, serves `releases.pwndbg.re` only |
-| ClickHouse | `127.0.0.1:9000` | `clickhouse` | `clickhouse-server:25.3-alpine` |
-| cloudflared | — | — | system daemon **(external)** |
+| Service | Address          | Container | Source                                              |
+|---|------------------|---|-----------------------------------------------------|
+| proxy | `127.0.0.1:8031` | `pwndbg-debuginfod-proxy` | `cmd/proxy`                                         |
+| nix backend | `127.0.0.1:8034` | `pwndbg-debuginfod-nix` | `cmd/nix-debuginfod`, one upstream among the others |
+| releases | `127.0.0.1:8033` | `pwndbg-debuginfod-releases` | `cmd/releases`, serves `releases.pwndbg.re` only    |
+| ClickHouse | `127.0.0.1:9000` | `clickhouse` | `clickhouse-server:25.3-alpine`                     |
+| cloudflared | —                | — | system daemon **(external)**                        |
 
 Volumes: `ch_data`, `ch_logs`, `pwndbg_debuginfod_cache`. All survive `docker rm -f`.
 
@@ -96,7 +96,9 @@ Four of them. The inner two cache *resolution*, the outer two cache *bytes*.
 Break one of these and something fails quietly.
 
 - **Everything arrives through Cloudflare.** The origin is loopback-only. Most of the rest depends
-  on this.
+  on this. `CF-Connecting-IP` and `CF-IPCountry` are both believed only from a trusted peer, and
+  loopback counts as trusted — so any process on this host can write its own address and country
+  into `access_log`, and with `--network host` that means the whole machine.
 - **Cloudflare accepts `Content-Encoding: gzip` regardless of the client's `Accept-Encoding`.** We
   ignore that header entirely — `writeBody` never reads it. RFC 9110 forbids this; the CDN is what
   makes it safe.
@@ -148,8 +150,15 @@ Known-wrong on purpose, or known-wrong and unfixed.
 - **Eviction measures apparent size, `cache_stats` measures allocated.** On btrfs the budget bites
   earlier than the disk requires.
 - **`/stats` counts origin load, not client demand.** Edge hits never reach `access_log`.
+- **GitHub Actions traffic is excluded from `/stats`**, from the `tags` written when each row was
+  logged. It is 89% of all traffic, so the page describes a very different service with the filter
+  than without it. Two consequences: the upstream-probe panel is *not* filtered, because
+  `resolve_logs` records no client address; and a request logged before the range list loads is
+  tagged `unclassified` and **counted**, since nothing can classify it afterwards.
+  `scripts/backfill_tags.py` repairs those. Turning `GH_RANGES_ENABLED` off makes every row
+  `unclassified`, i.e. no filtering at all.
 - **Release-redirect history lives in a second table.** It used to be `access_log` rows under
-  `endpoint_name = 'releases'`; `cmd/releases/MIGRATION.sql` moves them into `releases_access_log`
+  `endpoint_name = 'releases'`; `cmd/releases/MIGRATION.sql` (already run) moved them into `releases_access_log`
   and deletes them from `access_log`. Anything still querying the old location — the
   `/d/github-downloads` Grafana panel did — has to be repointed in the same change.
 - **`country` is empty for every migrated row**, and for all rows if Cloudflare's IP geolocation
@@ -163,14 +172,14 @@ Known-wrong on purpose, or known-wrong and unfixed.
 
 ```sql
 INSERT INTO buildid_state
-    (buildid, last_host, last_error, counter, last_success, updated_at, response_headers)
+(buildid, last_host, last_error, counter, last_success, updated_at, response_headers)
 SELECT buildid, '', '', 0, false, now(), tuple(0, '', '', '')
 FROM (
-    SELECT buildid,
-           argMax(counter, updated_at)      AS counter,
-           argMax(last_success, updated_at) AS ok
-    FROM buildid_state GROUP BY buildid
-)
+       SELECT buildid,
+              argMax(counter, updated_at)      AS counter,
+              argMax(last_success, updated_at) AS ok
+       FROM buildid_state GROUP BY buildid
+     )
 WHERE counter > 30 AND ok = false
 ```
 

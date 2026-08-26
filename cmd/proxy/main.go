@@ -179,6 +179,12 @@ func main() {
 			WithField("max_bytes", Config.CacheMaxBytes).Info("file cache enabled")
 	}
 
+	if Config.GHRangesEnabled {
+		go NewGHRangeCollector(Config.GHRangesServices).Worker(ctx, Config.GHRangesInterval)
+		log.WithField("services", Config.GHRangesServices).
+			WithField("interval", Config.GHRangesInterval).Info("GitHub IP range tagging enabled")
+	}
+
 	if Config.StatsEnabled {
 		s.stats = NewStatsCollector(db, Config.StatsDays)
 		go s.stats.Worker(ctx, Config.StatsInterval)

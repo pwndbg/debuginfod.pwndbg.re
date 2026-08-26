@@ -90,10 +90,14 @@ figcaption{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;margin-botto
 .swline{display:inline-block;width:14px;height:0;border-top:1px dashed var(--muted);margin-right:6px;vertical-align:3px}
 .cross{stroke:var(--text-secondary);stroke-width:1;vector-effect:non-scaling-stroke;opacity:.6}
 .brow{display:flex;align-items:center;gap:10px;padding:3px 0}
-.blab{flex:0 0 96px;font-size:12.5px;color:var(--text-secondary)}
+.blab{flex:0 0 128px;font-size:12.5px;color:var(--text-secondary)}
 .btrack{flex:1;height:14px;background:var(--grid);border-radius:4px;overflow:hidden}
 .bfill{display:block;height:100%;background:var(--served);border-radius:4px}
 .bval{flex:0 0 78px;text-align:right;font-size:12.5px;font-variant-numeric:tabular-nums}
+.bsub{flex:0 0 92px;text-align:right;font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums}
+.btail{padding:7px 0 1px;font-size:12px;color:var(--text-muted);border-top:1px solid var(--grid);margin-top:5px}
+.off{margin-left:6px;padding:0 5px;border-radius:9px;font-size:10.5px;font-weight:600;letter-spacing:.02em;
+     color:var(--err);border:1px solid var(--err);vertical-align:1px;white-space:nowrap}
 .tip{position:absolute;pointer-events:none;background:var(--surface-1);border:1px solid var(--border);
  border-radius:8px;padding:6px 9px;font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.14);
  white-space:nowrap;z-index:5;font-variant-numeric:tabular-nums;line-height:1.45}
@@ -433,6 +437,7 @@ func renderStats(s *statsSnapshot) []byte {
 	renderBytes(&b, s)
 	renderProbes(&b, s)
 	renderThroughput(&b, s)
+	renderCountries(&b, s)
 	renderCache(&b, s)
 
 	b.WriteString(`<p class="foot">Y scale is shared across a host&rsquo;s three panels but independent between ` +
@@ -508,6 +513,21 @@ func renderClients(b *strings.Builder, s *statsSnapshot) {
 	b.WriteString(`</div>`)
 }
 
+// offlineBadge is one piece of markup shared by both panels that name hosts.
+//
+// It is a function because it is used twice and the first version marked hosts
+// in the probe panel only, so the same upstream read as live in one section and
+// dead in the other. It is also not colour alone: the word "offline" and the
+// title carry the meaning for a colourblind reader, a greyscale print and a
+// screen reader alike.
+func offlineBadge(off bool) string {
+	if !off {
+		return ""
+	}
+	return `<span class="off" title="no probe in the last 24 h - this upstream is no longer ` +
+		`in the servers map">offline</span>`
+}
+
 func renderTraffic(b *strings.Builder, s *statsSnapshot) {
 	b.WriteString(`<h2 class="sec">Traffic by upstream and endpoint</h2>`)
 	for _, host := range s.Hosts {
@@ -540,7 +560,9 @@ func renderTraffic(b *strings.Builder, s *statsSnapshot) {
 			max = 1
 		}
 
-		tag := ""
+		// unresolved and offline are mutually exclusive - the first is the
+		// absence of a host, and offlineHosts skips it for exactly that reason.
+		tag := offlineBadge(s.isOffline(host))
 		if host == unresolvedLabel {
 			tag = `<span class="tag">never reached an upstream</span>`
 		}
@@ -615,20 +637,38 @@ func renderBytes(b *strings.Builder, s *statsSnapshot) {
 	fmt.Fprintf(b, `<div class="card"><figcaption><span class="epname">By upstream</span>`+
 		`<span class="hstat">total <b>%s</b></span></figcaption>`, fmtBytes(s.BytesTotal[3]))
 	for _, r := range rows {
-		fmt.Fprintf(b, `<div class="brow"><span class="blab">%s</span>`+
+		fmt.Fprintf(b, `<div class="brow"><span class="blab">%s%s</span>`+
 			`<span class="btrack"><span class="bfill" style="width:%.2f%%"></span></span>`+
 			`<span class="bval">%s</span></div>`,
-			esc(r.host), 100*float64(r.val)/float64(max), fmtBytes(r.val))
+			esc(r.host), offlineBadge(s.isOffline(r.host)),
+			100*float64(r.val)/float64(max), fmtBytes(r.val))
 	}
 	b.WriteString(`</div>`)
+}
+
+// offlineNote explains the badge where it appears, and says nothing when it
+// does not - including on a day quiet enough that nothing was probed, where the
+// absence of evidence must not read as evidence of absence.
+func offlineNote(s *statsSnapshot) string {
+	n := s.offlineCount()
+	if n == 0 {
+		return ""
+	}
+	verb, pronoun := "is", "it is"
+	if n > 1 {
+		verb, pronoun = "are", "they are"
+	}
+	return fmt.Sprintf(` <b>%d</b> of these went unprobed in the last 24 h and %s marked `+
+		`<span class="off">offline</span> &mdash; %s charted because there is history, `+
+		`not because anything is still asking.`, n, verb, pronoun)
 }
 
 func renderProbes(b *strings.Builder, s *statsSnapshot) {
 	b.WriteString(`<h2 class="sec">Resolution probes &mdash; per debuginfod backend</h2>`)
 	fmt.Fprintf(b, `<p class="sub">From <code>resolve_logs</code>: every cold build ID is probed at <em>all</em> `+
 		`upstreams concurrently, so each backend sees roughly the same probe count. Latency is measured separately `+
-		`on probes that answered and on those that did not. %s probes &middot; %s resolved (%s).</p>`,
-		fmtCount(s.ProbeTotal), fmtCount(s.ProbeOK), pct(s.ProbeOK, s.ProbeTotal))
+		`on probes that answered and on those that did not. %s probes &middot; %s resolved (%s).%s</p>`,
+		fmtCount(s.ProbeTotal), fmtCount(s.ProbeOK), pct(s.ProbeOK, s.ProbeTotal), offlineNote(s))
 	b.WriteString(`<div class="legend">` + swatch("--served", "resolved / p50") +
 		swatch("--notfound", "no answer") + swatch("--band", "p95 band, successful") +
 		swatch("--err", "failed probe latency") +
@@ -674,9 +714,9 @@ func renderProbes(b *strings.Builder, s *statsSnapshot) {
 		okMax := maxPairHi(smoothPairs(okPairs, s.Smooth))
 		failMax := maxPairHi(smoothPairs(failPairs, s.Smooth))
 
-		fmt.Fprintf(b, `<section class="hostrow"><div class="rowhead"><span class="hname">%s</span>`+
+		fmt.Fprintf(b, `<section class="hostrow"><div class="rowhead"><span class="hname">%s</span>%s`+
 			`<span class="hstat"><b>%s</b> probes &middot; <b>%s</b> resolved (%s)</span></div><div class="row3">`,
-			esc(host), fmtCount(ok+fail), fmtCount(ok), pct(ok, ok+fail))
+			esc(host), offlineBadge(s.isOffline(host)), fmtCount(ok+fail), fmtCount(ok), pct(ok, ok+fail))
 
 		okF, failF := toFloats(colOK(series)), toFloats(colFail(series))
 		card(b, "probes", fmt.Sprintf("peak %s/day", fmtCount(uint64(pmax))),
@@ -726,13 +766,158 @@ func renderThroughput(b *strings.Builder, s *statsSnapshot) {
 			n += t.N
 			p50[i], p90[i] = t.P50, t.P90
 		}
-		card(b, host,
+		card(b, esc(host)+offlineBadge(s.isOffline(host)),
 			fmt.Sprintf("%s transfers &middot; median <b>%.2f</b> MiB/s", fmtCount(n), median(p50)),
 			bandPanel(pairs, s.ThruMax, "Upstream throughput for "+host, 0, s.Smooth),
 			seriesJSON(s.Days, p50, p90),
 			jsonStrings("p50 MiB/s", "p90 MiB/s"), jsonStrings("--served", "--band"), "")
 	}
 	b.WriteString(`</div>`)
+}
+
+// countryRows is how many countries get their own bar before the rest are
+// folded into one. Past a dozen the bars are too short to compare and the list
+// stops being a ranking and becomes a table nobody reads.
+const countryRows = 12
+
+// flagFor turns an ISO 3166-1 alpha-2 code into its flag emoji, which is just
+// the two letters shifted into the regional-indicator block.
+//
+// It returns "" for anything that is not exactly two ASCII letters. That guard
+// is not decoration: country originates in the CF-IPCountry header, which any
+// process on this host can set (loopback is trusted), so the value reaching
+// here is not guaranteed to be a country at all. Cloudflare also sends XX for
+// an address it cannot place and T1 for Tor, neither of which is a country -
+// they are shown as plain labels rather than as whatever glyph pair the
+// arithmetic would produce.
+func flagFor(code string) string {
+	if len(code) != 2 || code == "XX" || code == "T1" {
+		return ""
+	}
+	var r [2]rune
+	for i := range 2 {
+		c := code[i]
+		if c < 'A' || c > 'Z' {
+			return ""
+		}
+		r[i] = rune(c-'A') + 0x1F1E6
+	}
+	return string(r[:])
+}
+
+// countryLabel renders a country code for display: its flag where one can be
+// derived, and the code itself always escaped.
+//
+// It is a function rather than two lines at each call site because there are
+// two call sites - the bar row and the "Top country" headline - and the first
+// version escaped only one of them. country comes from the CF-IPCountry header,
+// so that was a live injection point on a page an operator opens;
+// TestCountryPanelEscapesAttackerControlledLabels caught it and now pins it.
+func countryLabel(code string) string {
+	if flag := flagFor(code); flag != "" {
+		return flag + " " + esc(code)
+	}
+	return esc(code)
+}
+
+// renderCountries draws where the traffic came from.
+//
+// A ranked bar list rather than a map or a time series: the question is which
+// places dominate and by how much, and with ~200 categories and a very long
+// tail that is a comparison of magnitudes, not a shape over time. It reuses the
+// same .brow/.bfill row as the bytes panel instead of introducing a second
+// visual language for the same job.
+//
+// Two numbers per row, because one of them alone misleads in a way this service
+// actually sees: requests say how much came from a country, peak clients/day
+// say whether that was many people or one machine in a loop. Measured on
+// production, SK sent 60k requests from 10 addresses.
+func renderCountries(b *strings.Builder, s *statsSnapshot) {
+	if len(s.Countries) == 0 {
+		// No rows rather than an empty frame: a country panel showing nothing
+		// reads as "nobody is using this", when it means the column was never
+		// filled. See scripts/backfill_country.py.
+		return
+	}
+
+	var rows []countryRow
+	var total uint64
+	for _, c := range s.Countries {
+		total += sumU(s.Country[c])
+	}
+	if total == 0 {
+		return
+	}
+
+	var otherReq uint64
+	otherN := 0
+	for i, c := range s.Countries {
+		req := sumU(s.Country[c])
+		if req == 0 {
+			continue
+		}
+		if i < countryRows {
+			rows = append(rows, countryRow{label: c, requests: req, peak: maxU(s.CountryClients[c]), n: 1})
+			continue
+		}
+		otherReq += req
+		otherN++
+	}
+	if len(rows) == 0 {
+		return
+	}
+
+	top := rows[0].requests
+
+	b.WriteString(`<h2 class="sec">Where requests come from</h2><div class="kpis">`)
+	kpi(b, "Countries", fmtCount(uint64(len(s.Countries))))
+	kpi(b, "Top country", countryLabel(rows[0].label)+" "+pct(rows[0].requests, total))
+	kpi(b, "Top 5 share", pct(sumTop(rows, 5), total))
+	b.WriteString(`</div>`)
+
+	fmt.Fprintf(b, `<div class="card"><figcaption><span class="epname">By country</span>`+
+		`<span class="hstat">requests &middot; peak clients/day</span></figcaption>`)
+	for _, r := range rows {
+		fmt.Fprintf(b, `<div class="brow"><span class="blab">%s</span>`+
+			`<span class="btrack"><span class="bfill" style="width:%.2f%%"></span></span>`+
+			`<span class="bval">%s</span><span class="bsub">%s clients</span></div>`,
+			countryLabel(r.label), 100*float64(r.requests)/float64(top),
+			fmtCount(r.requests), fmtCount(r.peak))
+	}
+
+	// The tail gets a line, never a bar. It is the sum of dozens of countries,
+	// so on a scale where the leading country is full width it is routinely
+	// wider than the track - the first version drew it at 257% and the bar
+	// silently clipped, making the residual look like the largest single
+	// origin. It is not a peer of the rows above it and should not be drawn as
+	// one.
+	if otherN > 0 {
+		fmt.Fprintf(b, `<div class="btail">+ %d more countries &middot; %s requests (%s)</div>`,
+			otherN, fmtCount(otherReq), pct(otherReq, total))
+	}
+	b.WriteString(`</div>`)
+}
+
+// countryRow is one bar. n > 1 marks the folded tail.
+type countryRow struct {
+	label    string
+	requests uint64
+	peak     uint64
+	n        int
+}
+
+// sumTop adds the first k rows, stopping at the folded tail: "top 5 share" has
+// to mean five countries, and counting the "other" row towards it would fold
+// the whole long tail into the headline it is meant to be contrasted with.
+func sumTop(rows []countryRow, k int) uint64 {
+	var sum uint64
+	for i, r := range rows {
+		if i >= k || r.n > 1 {
+			break
+		}
+		sum += r.requests
+	}
+	return sum
 }
 
 func renderCache(b *strings.Builder, s *statsSnapshot) {

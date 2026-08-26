@@ -75,6 +75,8 @@ func AccessLogMiddleware(db accessLogger, endpointName string, next HandleWithEr
 			Timestamp:    time.Now(),
 			EndpointName: endpointName,
 			RemoteIP:     ip,
+			Country:      getCFCountry(r),
+			Tags:         ghTagsFor(ip),
 			Method:       r.Method,
 			RequestURI:   r.RequestURI,
 			UserAgent:    r.Header.Get("User-Agent"),

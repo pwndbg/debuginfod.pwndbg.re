@@ -153,3 +153,29 @@ func getRealIP(r *http.Request) (netip.Addr, error) {
 
 	return remoteIP, nil
 }
+
+// getCFCountry returns the country Cloudflare assigned to the client, or "".
+//
+// It repeats getRealIP's trust check rather than assuming that a request which
+// yielded a CF-Connecting-IP also has a believable country: both headers are
+// trivially forgeable by anything that can reach the origin port, and the only
+// thing that makes either of them evidence is that the peer is Cloudflare.
+// Deliberately not folded into getRealIP - that function returns an address and
+// callers that only want the address should not have to ignore a second value.
+//
+// Empty is also the normal answer when Cloudflare's IP geolocation setting is
+// off, so an empty country means "not known", never "not from Cloudflare".
+func getCFCountry(r *http.Request) string {
+	country := r.Header.Get("CF-IPCountry")
+	if country == "" {
+		return ""
+	}
+	ap, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err != nil || !GetCFIPManager().IsTrusted(ap.Addr()) {
+		return ""
+	}
+	// XX is what Cloudflare sends for a client it could not place, and T1 for
+	// Tor. Both are kept: they say something, and dropping them would make the
+	// column silently mean "known country or nothing".
+	return country
+}

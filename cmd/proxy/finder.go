@@ -371,6 +371,10 @@ func (f *DebugInfoFinder) tryAllServers(ctx context.Context, buildID string, req
 	entriesMu := sync.Mutex{}
 
 	for _, server := range f.servers {
+		if server.Down {
+			continue
+		}
+
 		go func(server *Server) {
 			startAt := time.Now()
 			headers, err := f.Probe(ctxForFind, server.URL+requestURI)

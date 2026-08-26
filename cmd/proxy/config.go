@@ -34,6 +34,22 @@ type configEnv struct {
 	// once per StatsInterval in the background and the handler serves finished
 	// HTML from memory. Refreshing more often buys nothing: the data is bucketed
 	// by day.
+	// Client classification from api.github.com/meta. Refreshed daily: GitHub
+	// republishes the document continuously, but the actions ranges are Azure
+	// allocations that move on the scale of weeks, so a shorter period costs
+	// requests and changes nothing.
+	//
+	// Turning this off means nothing is ever classified: every request is
+	// logged as "unclassified" and /stats counts all of it, CI included. There
+	// is no second code path - the filter in the queries is unconditional and
+	// simply finds no github_actions tags to drop.
+	GHRangesEnabled  bool          `env:"GH_RANGES_ENABLED" envDefault:"true"`
+	GHRangesInterval time.Duration `env:"GH_RANGES_INTERVAL" envDefault:"24h"`
+	// Which api.github.com/meta keys to treat as CI. actions_macos is listed
+	// separately by GitHub and is not included by default - it is a handful of
+	// prefixes and macOS runners are not what floods a debuginfod.
+	GHRangesServices []string `env:"GH_RANGES_SERVICES" envSeparator:"," envDefault:"actions"`
+
 	StatsEnabled  bool          `env:"STATS_ENABLED" envDefault:"true"`
 	StatsDays     int           `env:"STATS_DAYS" envDefault:"360"`
 	StatsInterval time.Duration `env:"STATS_INTERVAL" envDefault:"1h"`

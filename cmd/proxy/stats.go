@@ -15,8 +15,16 @@ import (
 	"github.com/julienschmidt/httprouter"
 )
 
-// Endpoints shown on /stats. "releases" is left out - it is a redirect to
-// GitHub, not part of the debuginfod protocol.
+// Endpoints shown on /stats, and the only three this service logs - the router
+// registers AccessLogMiddleware under exactly these names.
+//
+// Every panel filters on this list rather than excluding what it does not want.
+// The clients panel used to say endpoint_name != 'releases' instead, from when
+// the release redirect lived here; those rows moved to releases_access_log and
+// were deleted from access_log by cmd/releases/MIGRATION.sql, so the exclusion
+// had stopped matching anything at all. A negative filter is the wrong shape
+// here anyway: a new endpoint added to the router would silently enter the
+// client counts while being absent from every chart beside them.
 var statsEndpoints = []string{"debuginfo", "executable", "source"}
 
 // unresolvedLabel stands in for an empty resolved_host. An empty field means the
@@ -77,9 +85,38 @@ type statsSnapshot struct {
 	ProbeTotal uint64
 	ProbeOK    uint64
 
+	// Probes in the last 24 hours, per host, plus the total across all of them.
+	//
+	// tryAllServers probes every configured upstream on every cold build ID, so
+	// a host that is still in the map cannot go a day without rows. Zero here
+	// therefore means it is no longer being asked at all - it was removed from
+	// the servers map (elfutils and alpine are commented out there) - and the
+	// page says so beside its name.
+	//
+	// The total is what makes that reading safe. On a day with no cold build
+	// IDs nobody is probed, every host reads zero, and marking them all offline
+	// would be reporting our own idleness as their outage. See offlineHosts.
+	//
+	// Not sliced with the views: "last 24 h" is the same window whichever chart
+	// length is on screen.
+	ProbeRecent      map[string]uint64
+	ProbeRecentTotal uint64
+
 	Thru      map[string][]thruDay
 	ThruHosts []string
 	ThruMax   float64
+
+	// Where the traffic comes from: country -> one value per day in Days.
+	//
+	// Daily rather than one total per country, because /stats slices four views
+	// out of a single collection and a total cannot be cut down to seven days.
+	// Requests sum across days correctly; distinct clients do NOT, which is why
+	// CountryClients holds the per-day figure and the panel reports its peak
+	// rather than a sum - a client active on thirty days would otherwise count
+	// as thirty clients.
+	Country        map[string][]uint64
+	CountryClients map[string][]uint64
+	Countries      []string // sorted by request volume descending
 
 	// Cache and partition usage: the last measurement of each day, in MiB.
 	// HasCacheStats stays false while the table is empty - the whole section then
@@ -115,7 +152,11 @@ func (s *dbSrv) CollectStats(ctx context.Context, days int) (*statsSnapshot, err
 		Traffic:     map[string]map[string][]statusCounts{},
 		Bytes:       map[string][4]uint64{},
 		Probes:      map[string][]probeDay{},
+		ProbeRecent: map[string]uint64{},
 		Thru:        map[string][]thruDay{},
+
+		Country:        map[string][]uint64{},
+		CountryClients: map[string][]uint64{},
 	}
 
 	// The time axis is built from the clock, not from the data: a day with no
@@ -146,6 +187,12 @@ func (s *dbSrv) CollectStats(ctx context.Context, days int) (*statsSnapshot, err
 	if err := s.collectThroughput(ctx, snap, idx, n, days); err != nil {
 		return nil, fmt.Errorf("throughput: %w", err)
 	}
+	if err := s.collectCountries(ctx, snap, idx, n, days); err != nil {
+		return nil, fmt.Errorf("countries: %w", err)
+	}
+	if err := s.collectProbeRecent(ctx, snap); err != nil {
+		return nil, fmt.Errorf("recent probes: %w", err)
+	}
 	if err := s.collectCacheUsage(ctx, snap, idx, n, days); err != nil {
 		return nil, fmt.Errorf("cache usage: %w", err)
 	}
@@ -166,6 +213,27 @@ func endpointInList() string {
 	return strings.Join(quoted, ", ")
 }
 
+// excludeCI drops requests made by GitHub Actions runners.
+//
+// /stats is meant to describe people using the service. A workflow that
+// installs pwndbg on every push makes a handful of build IDs look like
+// sustained demand and inflates the distinct-client count.
+//
+// One mechanism now: the row's own tags, written when it was logged and decided
+// against the range list as it stood at that moment. There used to be a second
+// - an ip_trie dictionary in ClickHouse, consulted for rows that predated
+// tagging - and it was removed once scripts/backfill_tags.py had classified
+// every one of them. Do not bring it back as a general safety net: matching an
+// old row against today's ranges reattributes traffic every time GitHub hands a
+// prefix back to Azure, which is precisely why the decision is recorded per row
+// instead of recomputed.
+//
+// Rows tagged "unclassified" - logged before the range list had ever loaded -
+// are counted here rather than dropped. That is the conservative direction:
+// they show up as ordinary traffic instead of silently vanishing, and
+// scripts/backfill_tags.py exists to resolve them.
+const excludeCI = ` AND NOT has(tags, 'github_actions')`
+
 // trafficQuery is a package-level variable rather than a constant inside the
 // method so a test can pin the category split - in particular which side 503
 // falls on.
@@ -178,7 +246,7 @@ var trafficQuery = `
 		       countIf(status != 200 AND (status < 500 OR status IN (501, 503)))  AS notfound,
 		       countIf(status >= 500 AND status NOT IN (501, 503))                AS err5xx
 		FROM access_log
-		WHERE timestamp >= today() - ? AND endpoint_name IN (` + endpointInList() + `)
+		WHERE timestamp >= today() - ? AND endpoint_name IN (` + endpointInList() + `)` + excludeCI + `
 		GROUP BY d, host, ep
 	`
 
@@ -231,14 +299,18 @@ func (s *dbSrv) collectTraffic(ctx context.Context, snap *statsSnapshot, idx map
 	return nil
 }
 
-func (s *dbSrv) collectClients(ctx context.Context, snap *statsSnapshot, idx map[string]int, n, days int) error {
-	const query = `
+// clientsQuery is a package-level variable for the same two reasons as
+// trafficQuery: endpointInList() is a call, so it cannot be a constant, and a
+// test can then check it counts the same endpoints the traffic panel does.
+var clientsQuery = `
 		SELECT toDate(timestamp) AS d, uniq(remote_ip), uniq(buildid), count()
 		FROM access_log
-		WHERE timestamp >= today() - ? AND endpoint_name != 'releases'
+		WHERE timestamp >= today() - ? AND endpoint_name IN (` + endpointInList() + `)` + excludeCI + `
 		GROUP BY d
 	`
-	rows, err := s.conn.Query(ctx, query, days)
+
+func (s *dbSrv) collectClients(ctx context.Context, snap *statsSnapshot, idx map[string]int, n, days int) error {
+	rows, err := s.conn.Query(ctx, clientsQuery, days)
 	if err != nil {
 		return err
 	}
@@ -274,7 +346,7 @@ func (s *dbSrv) collectBytes(ctx context.Context, snap *statsSnapshot, days int)
 		       sumIf(bytes_sent, timestamp >= t - INTERVAL 30 DAY) AS b30,
 		       sum(bytes_sent)                                     AS ball
 		FROM access_log
-		WHERE timestamp >= today() - ?
+		WHERE timestamp >= today() - ?` + excludeCI + `
 		GROUP BY host
 	`
 	rows, err := s.conn.Query(ctx, query, unresolvedLabel, days)
@@ -369,7 +441,7 @@ func (s *dbSrv) collectThroughput(ctx context.Context, snap *statsSnapshot, idx 
 		FROM access_log
 		WHERE timestamp >= today() - ?
 		  AND status = 200 AND error_msg = '' AND bytes_sent > 102400
-		  AND cache_status NOT IN ('HIT', 'COALESCED') AND resolved_host != ''
+		  AND cache_status NOT IN ('HIT', 'COALESCED') AND resolved_host != ''` + excludeCI + `
 		GROUP BY d, host
 	`
 	rows, err := s.conn.Query(ctx, query, days)
@@ -426,6 +498,160 @@ func (s *dbSrv) collectThroughput(ctx context.Context, snap *statsSnapshot, idx 
 }
 
 const mib = 1 << 20
+
+// countryQuery is a package-level variable for the same reason as trafficQuery
+// and clientsQuery: endpointInList() is a call, and a test can then check that
+// this panel counts the same endpoints and excludes the same CI traffic as the
+// ones beside it.
+//
+// country = ” is dropped rather than bucketed as "unknown". After the mmdb
+// backfill the only addresses left without one are 127.0.0.1 and the Docker
+// bridge - this host talking to itself, which is not a place traffic comes
+// from. A visible "unknown" bar would invite reading it as unlocatable users.
+var countryQuery = `
+		SELECT toDate(timestamp) AS d, country, count(), uniq(remote_ip)
+		FROM access_log
+		WHERE timestamp >= today() - ? AND endpoint_name IN (` + endpointInList() + `)
+		  AND country != ''` + excludeCI + `
+		GROUP BY d, country
+	`
+
+func (s *dbSrv) collectCountries(ctx context.Context, snap *statsSnapshot, idx map[string]int, n, days int) error {
+	rows, err := s.conn.Query(ctx, countryQuery, days)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			day               time.Time
+			country           string
+			requests, uniques uint64
+		)
+		if err := rows.Scan(&day, &country, &requests, &uniques); err != nil {
+			return err
+		}
+		i, ok := idx[day.Format("2006-01-02")]
+		if !ok {
+			continue
+		}
+		if _, seen := snap.Country[country]; !seen {
+			snap.Country[country] = make([]uint64, n)
+			snap.CountryClients[country] = make([]uint64, n)
+			snap.Countries = append(snap.Countries, country)
+		}
+		snap.Country[country][i] = requests
+		snap.CountryClients[country][i] = uniques
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	sortCountries(snap)
+	return nil
+}
+
+// probeRecentQuery counts the last day only.
+//
+// A second pass over resolve_logs rather than a countIf folded into the main
+// probe query: that one groups by day and scans the whole 360-day window, while
+// this one is bounded by a timestamp predicate on the table's own sort key
+// (ORDER BY (timestamp, buildid)), so it reads one day of parts instead of all
+// of them.
+const probeRecentQuery = `
+		SELECT resolved_host, count()
+		FROM resolve_logs
+		WHERE timestamp >= now() - INTERVAL 1 DAY
+		GROUP BY resolved_host
+	`
+
+func (s *dbSrv) collectProbeRecent(ctx context.Context, snap *statsSnapshot) error {
+	rows, err := s.conn.Query(ctx, probeRecentQuery)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			host string
+			n    uint64
+		)
+		if err := rows.Scan(&host, &n); err != nil {
+			return err
+		}
+		snap.ProbeRecent[host] = n
+		snap.ProbeRecentTotal += n
+	}
+	return rows.Err()
+}
+
+// isOffline reports whether a host has stopped being probed.
+//
+// A predicate rather than a precomputed set of hosts, because four panels name
+// hosts - traffic, bytes, probes and throughput - each from its own list, and
+// the first version marked only one of them. The same upstream then read as
+// live in one section and dead in the other. Anything that can name a host can
+// ask this.
+//
+// Two guards, and both are load-bearing:
+//
+//   - ProbeRecentTotal == 0 means nobody was probed at all. tryAllServers probes
+//     every configured upstream on every cold build ID, so that is the signature
+//     of a night with no cold build IDs, not of every backend failing at once.
+//     Reporting our own idleness as their outage would be worse than saying
+//     nothing.
+//   - unresolvedLabel is not a host. It stands in for an empty resolved_host -
+//     the request never reached an upstream - so it is never probed and would
+//     otherwise be marked offline on every page load.
+func (s *statsSnapshot) isOffline(host string) bool {
+	if s.ProbeRecentTotal == 0 || host == "" || host == unresolvedLabel {
+		return false
+	}
+	return s.ProbeRecent[host] == 0
+}
+
+// offlineCount is how many of the probed backends have gone quiet, for the
+// sentence that explains the badge.
+func (s *statsSnapshot) offlineCount() int {
+	n := 0
+	for _, host := range s.ProbeHosts {
+		if s.isOffline(host) {
+			n++
+		}
+	}
+	return n
+}
+
+// sortCountries orders by requests over the window, descending. It runs again
+// after slicing, because the leader over 360 days need not lead over 7.
+func sortCountries(snap *statsSnapshot) {
+	sort.Slice(snap.Countries, func(i, j int) bool {
+		a, b := sumU(snap.Country[snap.Countries[i]]), sumU(snap.Country[snap.Countries[j]])
+		if a != b {
+			return a > b
+		}
+		return snap.Countries[i] < snap.Countries[j]
+	})
+}
+
+func sumU(v []uint64) uint64 {
+	var sum uint64
+	for _, x := range v {
+		sum += x
+	}
+	return sum
+}
+
+func maxU(v []uint64) uint64 {
+	var max uint64
+	for _, x := range v {
+		if x > max {
+			max = x
+		}
+	}
+	return max
+}
 
 func (s *dbSrv) collectCacheUsage(ctx context.Context, snap *statsSnapshot, idx map[string]int, n, days int) error {
 	// argMax rather than avg: we want the state at the end of the day, because that
@@ -593,6 +819,15 @@ func sliceSnapshot(src *statsSnapshot, days int) *statsSnapshot {
 		}
 		return sum
 	})
+
+	out.Country = make(map[string][]uint64, len(src.Country))
+	out.CountryClients = make(map[string][]uint64, len(src.CountryClients))
+	for country, series := range src.Country {
+		out.Country[country] = cutU(series, from, n)
+		out.CountryClients[country] = cutU(src.CountryClients[country], from, n)
+	}
+	out.Countries = append([]string(nil), src.Countries...)
+	sortCountries(&out)
 
 	out.CacheBytes, out.CacheTmp = cutF(src.CacheBytes), cutF(src.CacheTmp)
 	out.CacheEntries, out.FsFree = cutF(src.CacheEntries), cutF(src.FsFree)

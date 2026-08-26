@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -35,6 +37,9 @@ func sampleSnapshot(days int) *statsSnapshot {
 		Bytes:       map[string][4]uint64{},
 		Probes:      map[string][]probeDay{},
 		Thru:        map[string][]thruDay{},
+
+		Country:        map[string][]uint64{},
+		CountryClients: map[string][]uint64{},
 	}
 	base := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
 	for i := 0; i < days; i++ {
@@ -42,7 +47,10 @@ func sampleSnapshot(days int) *statsSnapshot {
 	}
 	n := len(s.Days)
 
-	for _, host := range []string{unresolvedLabel, "fedora"} {
+	// elfutils appears in every host-keyed panel, because the badge has to reach
+	// all four of them and a fixture that only covers the probe panel is how the
+	// page came to contradict itself in the first place.
+	for _, host := range []string{unresolvedLabel, "fedora", "elfutils"} {
 		s.Traffic[host] = map[string][]statusCounts{}
 		for _, ep := range statsEndpoints {
 			series := make([]statusCounts, n)
@@ -68,6 +76,22 @@ func sampleSnapshot(days int) *statsSnapshot {
 		}
 	}
 
+	// Weighted so the order is unambiguous and so the tail is long enough to be
+	// folded: countryRows is 12.
+	for k, code := range []string{"US", "PL", "DE", "SG", "BR", "CN", "IT", "FR", "JP", "GB",
+		"NL", "SE", "ES", "CA", "AU", "XX"} {
+		req := make([]uint64, n)
+		cli := make([]uint64, n)
+		for i := range n {
+			req[i] = uint64((len(code)*0 + 100 - 5*k) + i)
+			cli[i] = uint64(20 - k)
+		}
+		s.Country[code] = req
+		s.CountryClients[code] = cli
+		s.Countries = append(s.Countries, code)
+	}
+	sortCountries(s)
+
 	s.Clients = make([]uint64, n)
 	s.BuildIDs = make([]uint64, n)
 	s.Requests = make([]uint64, n)
@@ -81,13 +105,20 @@ func sampleSnapshot(days int) *statsSnapshot {
 		thru[i] = thruDay{N: 100, P50: 1.5, P90: 4.25}
 	}
 	s.Probes["fedora"] = probes
-	s.ProbeHosts = []string{"fedora"}
+	s.ProbeHosts = []string{"fedora", "elfutils"}
+	s.Probes["elfutils"] = s.Probes["fedora"]
+	// fedora is still being probed; elfutils has history but was dropped from the
+	// servers map, which is exactly the pair the offline badge exists to tell
+	// apart. A non-zero total is what makes the zero meaningful.
+	s.ProbeRecent = map[string]uint64{"fedora": 4200}
+	s.ProbeRecentTotal = 4200
 	for _, p := range probes {
 		s.ProbeTotal += p.OK + p.Fail
 		s.ProbeOK += p.OK
 	}
 	s.Thru["fedora"] = thru
-	s.ThruHosts = []string{"fedora"}
+	s.Thru["elfutils"] = thru
+	s.ThruHosts = []string{"fedora", "elfutils"}
 	s.ThruMax = 4.25
 	return s
 }
@@ -514,5 +545,253 @@ func TestAllViewsGetOwnSmoothWindow(t *testing.T) {
 		if got, want := sliceSnapshot(full, v).Smooth, smoothWindowFor(v); got != want {
 			t.Errorf("widok %dd ma okno %d, oczekiwano %d", v, got, want)
 		}
+	}
+}
+
+// The panels over access_log have to count the same endpoints, or the headline
+// client number describes a different population than the chart beside it.
+//
+// This is not hypothetical. The clients panel used to filter with
+// endpoint_name != 'releases', from when the release redirect was served here.
+// Those rows were moved to releases_access_log and deleted from access_log, so
+// the exclusion matched nothing and the panel had silently become "every
+// endpoint" while the traffic panel stayed on the named three. A negative
+// filter is the wrong shape regardless: a new route would enter the client
+// counts without appearing anywhere else on the page.
+func TestStatsPanelsAgreeOnEndpoints(t *testing.T) {
+	want := "endpoint_name IN (" + endpointInList() + ")"
+	for name, query := range map[string]string{
+		"traffic": trafficQuery,
+		"clients": clientsQuery,
+	} {
+		if !strings.Contains(query, want) {
+			t.Errorf("%s panel does not filter on %s", name, want)
+		}
+		if strings.Contains(query, "endpoint_name !=") {
+			t.Errorf("%s panel excludes an endpoint by name instead of listing the ones it wants", name)
+		}
+	}
+	// The list itself must not name an endpoint this service cannot log.
+	for _, ep := range statsEndpoints {
+		if ep == "releases" {
+			t.Error("statsEndpoints names 'releases', which moved to releases_access_log")
+		}
+	}
+}
+
+// country reaches the page from the CF-IPCountry header. It is believed only
+// from a Cloudflare peer, and loopback counts as trusted - which, with the
+// container on --network host, means any process on the machine can put an
+// arbitrary string in this column. The escaping is the only thing between that
+// and stored XSS on a page an operator opens. cmd/releases pins the same
+// property for filenames; this is the proxy's equivalent.
+func TestCountryPanelEscapesAttackerControlledLabels(t *testing.T) {
+	s := sampleSnapshot(30)
+	const payload = `<script>alert(1)</script>`
+	n := len(s.Days)
+	// Large enough to be one of the named bars: a country in the folded tail is
+	// rendered as "other (N)" and its label never reaches the page, so a small
+	// value here would make the test pass without exercising any escaping.
+	req := make([]uint64, n)
+	for i := range req {
+		req[i] = 100000
+	}
+	s.Country[payload] = req
+	s.CountryClients[payload] = make([]uint64, n)
+	s.Countries = append(s.Countries, payload)
+	sortCountries(s)
+
+	page := string(renderStats(s))
+	if strings.Contains(page, payload) {
+		t.Error("the raw payload reached the page unescaped")
+	}
+	if !strings.Contains(page, "&lt;script&gt;") {
+		t.Error("the label is not on the page at all - the escaping test proves nothing")
+	}
+}
+
+// A flag is derived arithmetically from the letters, so anything that is not
+// two ASCII letters would produce a nonsense glyph pair. XX and T1 are real
+// values Cloudflare sends and are not countries.
+func TestFlagForRejectsNonCountries(t *testing.T) {
+	if got := flagFor("PL"); got != "\U0001F1F5\U0001F1F1" {
+		t.Errorf("flagFor(PL) = %q, want the Polish flag", got)
+	}
+	for _, code := range []string{"XX", "T1", "", "P", "POL", "pl", "P1", `<script>`} {
+		if got := flagFor(code); got != "" {
+			t.Errorf("flagFor(%q) = %q, want no flag", code, got)
+		}
+	}
+}
+
+// "Top 5 share" has to mean five countries. The folded tail row stands for
+// dozens, so counting it would silently turn the headline into "top 5 plus
+// everything else", which is always close to 100%.
+func TestSumTopStopsAtTheFoldedTail(t *testing.T) {
+	rows := []countryRow{
+		{label: "US", requests: 100, n: 1},
+		{label: "PL", requests: 50, n: 1},
+		{label: "", requests: 900, n: 40},
+	}
+	if got := sumTop(rows, 5); got != 150 {
+		t.Errorf("sumTop = %d, want 150 (the tail must not count)", got)
+	}
+}
+
+// The four views come from one collection, so the country panel has to be
+// re-derived after slicing rather than carried over: the leader over 360 days
+// need not lead over 7, and a total cannot be cut down to a shorter window.
+func TestSliceSnapshotRecomputesCountryOrder(t *testing.T) {
+	s := sampleSnapshot(60)
+	n := len(s.Days)
+
+	// A country that sent nothing for most of the window and then took over.
+	// Enough to lead the last week, not enough to lead the whole window - which
+	// is the only shape that can tell "re-sorted after slicing" from "carried
+	// the full-window order over".
+	late := make([]uint64, n)
+	for i := n - 5; i < n; i++ {
+		late[i] = 400
+	}
+	s.Country["ZZ"] = late
+	s.CountryClients["ZZ"] = make([]uint64, n)
+	s.Countries = append(s.Countries, "ZZ")
+	sortCountries(s)
+
+	if s.Countries[0] == "ZZ" {
+		t.Fatal("ZZ already leads the full window - the test cannot show a difference")
+	}
+	cut := sliceSnapshot(s, 7)
+	if cut.Countries[0] != "ZZ" {
+		t.Errorf("over 7 days the leader is %q, want ZZ", cut.Countries[0])
+	}
+	if got := len(cut.Country["ZZ"]); got != len(cut.Days) {
+		t.Errorf("sliced series has %d points, want %d", got, len(cut.Days))
+	}
+	// The source must not have been mutated - the other views are cut from it.
+	if len(s.Country["ZZ"]) != n {
+		t.Errorf("slicing mutated the source series: %d points, want %d", len(s.Country["ZZ"]), n)
+	}
+}
+
+// The folded tail is a line, never a bar.
+//
+// It is the sum of every country past the twelfth, so on a scale where the
+// leading country is full width it is routinely wider than the track. The first
+// version drew it at 257%, which .btrack's overflow:hidden clipped to a full
+// bar - making the residual look like the single largest origin. Only rendering
+// the page showed it.
+func TestCountryTailIsNotDrawnAsABar(t *testing.T) {
+	s := sampleSnapshot(30)
+	n := len(s.Days)
+	// Enough countries past countryRows that their sum beats the leader.
+	for i := range 30 {
+		code := string(rune('A'+i/26)) + string(rune('a'+i%26))
+		series := make([]uint64, n)
+		for j := range series {
+			series[j] = 40
+		}
+		s.Country[code] = series
+		s.CountryClients[code] = make([]uint64, n)
+		s.Countries = append(s.Countries, code)
+	}
+	sortCountries(s)
+
+	page := string(renderStats(s))
+	i := strings.Index(page, "Where requests come from")
+	if i < 0 {
+		t.Fatal("the country section is missing")
+	}
+	section := page[i:]
+	if j := strings.Index(section, `<h2 class="sec"`); j > 0 {
+		section = section[:j]
+	}
+
+	for _, m := range regexp.MustCompile(`width:([\d.]+)%`).FindAllStringSubmatch(section, -1) {
+		w, err := strconv.ParseFloat(m[1], 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w > 100 {
+			t.Errorf("a bar is %.2f%% wide - it overflows its track", w)
+		}
+	}
+	if !strings.Contains(section, `class="btail"`) {
+		t.Error("the tail is missing entirely - it must be reported, just not as a bar")
+	}
+	if strings.Contains(section, "other (") {
+		t.Error("the tail is still rendered as a bar row")
+	}
+}
+
+// A host that has history but has not been probed for a day is no longer in the
+// servers map - elfutils and alpine are commented out there - and the page says
+// so beside its name instead of charting it as if it were still live.
+func TestProbePanelMarksUnprobedHostsOffline(t *testing.T) {
+	s := sampleSnapshot(30)
+	page := string(renderStats(s))
+
+	if !s.isOffline("elfutils") || s.isOffline("fedora") {
+		t.Fatalf("isOffline: elfutils=%v fedora=%v, want true/false",
+			s.isOffline("elfutils"), s.isOffline("fedora"))
+	}
+	// Four panels name hosts - traffic, bytes, probes and throughput - and the
+	// badge has to reach all four. Marking one and not the others makes the same
+	// upstream read as live in one section and dead in the next, which is
+	// exactly what the first version did.
+	sections := map[string]string{
+		"traffic":    "Traffic by upstream",
+		"bytes":      "Bytes served",
+		"probes":     "Resolution probes",
+		"throughput": "Upstream throughput",
+	}
+	for name, heading := range sections {
+		i := strings.Index(page, heading)
+		if i < 0 {
+			t.Errorf("%s section is missing (%q)", name, heading)
+			continue
+		}
+		section := page[i:]
+		if j := strings.Index(section[len(heading):], `<h2 class="sec"`); j > 0 {
+			section = section[:len(heading)+j]
+		}
+		e := strings.Index(section, "elfutils")
+		if e < 0 {
+			t.Errorf("%s section does not name elfutils at all", name)
+			continue
+		}
+		if k := strings.Index(section[e:], `class="off"`); k < 0 || k > 120 {
+			t.Errorf("%s section: elfutils carries no offline badge (offset %d)", name, k)
+		}
+		f := strings.Index(section, "fedora")
+		if f >= 0 {
+			seg := section[f:min(f+120, len(section))]
+			if strings.Contains(seg, `class="off"`) {
+				t.Errorf("%s section: fedora is marked offline although it was probed today", name)
+			}
+		}
+	}
+
+	// unresolved is not a host - it stands in for never having reached one - so
+	// it is never probed and must never be reported as an outage.
+	if s.isOffline(unresolvedLabel) {
+		t.Error("unresolved is reported offline; it is the absence of a host, not a dead one")
+	}
+}
+
+// The guard that keeps this honest. tryAllServers probes every configured
+// upstream on every cold build ID, so nobody being probed is the signature of a
+// quiet night, not of every backend failing at once. Announcing twelve outages
+// because nobody asked for a cold build ID would be worse than saying nothing.
+func TestProbePanelSaysNothingWhenNobodyWasProbed(t *testing.T) {
+	s := sampleSnapshot(30)
+	s.ProbeRecent = map[string]uint64{}
+	s.ProbeRecentTotal = 0
+
+	if s.isOffline("elfutils") || s.offlineCount() != 0 {
+		t.Error("hosts are reported offline on a day when nothing was probed at all")
+	}
+	if page := string(renderStats(s)); strings.Contains(page, `class="off"`) {
+		t.Error("the page marks hosts offline on a day when nothing was probed")
 	}
 }
