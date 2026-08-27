@@ -18,20 +18,26 @@ This proxy solves that: point your debugger at **one** URL and every build-id lo
 
 ## Upstream servers
 
-| Name       | URL                                         | debuginfo | executable | source | Old build ids |
-| ---------- | ------------------------------------------- | :-------: | :--------: | :----: | ------------- |
-| systemtap  | https://debuginfod.systemtap.org            |     ✅     |     ❌      |   ✅    | kept          |
-| opensuse   | https://debuginfod.opensuse.org             |     ✅     |     ✅      |   ✅    | expire       |
-| fedora     | https://debuginfod.fedoraproject.org        |     ✅     |     ✅      |   ✅    | kept          |
-| archlinux  | https://debuginfod.archlinux.org            |     ✅     |     ❌      |   ✅    | expire        |
-| artixlinux | https://debuginfod.artixlinux.org           |     ✅     |     ❌      |   ✅    | expire       |
-| cachyos    | https://debuginfod.cachyos.org              |     ✅     |     ❌      |   ✅    | expire       |
-| centos     | https://debuginfod.centos.org               |     ✅     |     ✅      |   ✅    | kept          |
-| debian     | https://debuginfod.debian.net               |     ✅     |     ❌      | ✅ ours |    expire     |
-| nix        | our own debuginfod server for nix / nixpkgs |     ✅     |     ✅      |   ✅    | kept          |
+| Name       | URL                                         | debuginfo | executable | source | IMA sig | Old build ids |
+| ---------- | ------------------------------------------- | :-------: | :--------: | :----: | :-----: | ------------- |
+| systemtap  | https://debuginfod.systemtap.org            |     ✅     |     ✅      |   ✅    |    ✅    | kept          |
+| fedora     | https://debuginfod.fedoraproject.org        |     ✅     |     ✅      |   ✅    |    ✅    | kept          |
+| centos     | https://debuginfod.centos.org               |     ✅     |     ✅      |   ✅    |    ✅    | kept          |
+| opensuse   | https://debuginfod.opensuse.org             |     ✅     |     ❌      |   ✅    |    ❔    | expire        |
+| archlinux  | https://debuginfod.archlinux.org            |     ✅     |     ❌      |   ✅    |    ❌    | expire        |
+| artixlinux | https://debuginfod.artixlinux.org           |     ✅     |     ❌      |   ✅    |    ❌    | expire        |
+| cachyos    | https://debuginfod.cachyos.org              |     ✅     |     ❌      |   ✅    |    ❌    | expire        |
+| debian     | https://debuginfod.debian.net               |     ✅     |     ❌      | ✅ ours |    ❌    | expire        |
+| nix        | our own debuginfod server for nix / nixpkgs |     ✅     |     ✅      |   ✅    |    ❌    | kept          |
 
-❔ means we have not served enough of that endpoint from that upstream to say. Debian serves no
-sources at all — that column is green because we serve them ourselves, see below.
+Debian serves no sources at all — that column is green because we serve them ourselves, see below.
+
+**IMA sig** is the `x-debuginfod-imasignature` header, used to verify what you downloaded. Only the
+Red Hat family sends it.
+
+**openSUSE answers on demand.** The first request for a build id it has not prepared yet returns
+404, and the same request succeeds minutes later; its responses carry no `x-debuginfod-*` headers at
+all. So a miss from openSUSE does not mean the build id is absent — try again.
 
 **Old build ids** is measured from our own logs: build ids we served once and later could not.
 *expire* means old builds do disappear upstream — around a month for archlinux, a few months for
