@@ -12,6 +12,7 @@ WORKDIR /app/
 COPY ./go.mod ./go.sum ./
 RUN go mod download
 COPY cmd/ ./cmd
+COPY useragent/ ./useragent
 # The nix/ package, which cmd/nix-debuginfod imports. The other two Dockerfiles copy
 # cmd/ alone because nothing they build needs it; this one does.
 COPY nix/ ./nix

@@ -20,6 +20,7 @@ rsync -avz --delete \
   "$(pwd)/cmd" \
   "$(pwd)/nix" \
   "$(pwd)/srcindex" \
+  "$(pwd)/useragent" \
   "$(pwd)/go.sum" \
   "$(pwd)/go.mod" \
   "$(pwd)/run.sh" \

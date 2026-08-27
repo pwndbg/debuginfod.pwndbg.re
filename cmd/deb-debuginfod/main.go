@@ -40,6 +40,7 @@ import (
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/julienschmidt/httprouter"
 	"github.com/pwndbg/debuginfod.pwndbg.re/srcindex"
+	"github.com/pwndbg/debuginfod.pwndbg.re/useragent"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -100,7 +101,7 @@ func main() {
 		resolved: expirable.NewLRU[string, pkgRef](resolveCacheSize, nil, resolveCacheTTL),
 		// No overall timeout: unpacking a source package is minutes on a cold
 		// package. Per-request contexts bound the parts that should be quick.
-		hc: &http.Client{},
+		hc: useragent.Client(&http.Client{}, "deb"),
 	}
 
 	router := httprouter.New()
@@ -256,7 +257,6 @@ func (s *srv) askDebian(ctx context.Context, buildID string) (pkgRef, error) {
 	if err != nil {
 		return pkgRef{}, err
 	}
-	req.Header.Set("user-agent", "pwndbg-debuginfod-deb")
 
 	resp, err := s.hc.Do(req)
 	if err != nil {

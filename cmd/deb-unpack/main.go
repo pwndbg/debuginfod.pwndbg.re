@@ -34,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pwndbg/debuginfod.pwndbg.re/useragent"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -97,7 +98,8 @@ func main() {
 		log.WithError(err).Fatal("creating unpack root")
 	}
 
-	s := &server{root: root, mirror: mirror, hc: &http.Client{Timeout: 10 * time.Minute}}
+	s := &server{root: root, mirror: mirror,
+		hc: useragent.Client(&http.Client{Timeout: 10 * time.Minute}, "deb-unpack")}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /unpack", s.handleUnpack)
 	mux.HandleFunc("GET /trees", s.handleTrees)
@@ -237,7 +239,6 @@ func (s *server) download(ctx context.Context, url, dst string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("user-agent", "pwndbg-debuginfod-deb-unpack")
 	resp, err := s.hc.Do(req)
 	if err != nil {
 		return err

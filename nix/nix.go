@@ -18,6 +18,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/nix-community/go-nix/pkg/narinfo"
+	"github.com/pwndbg/debuginfod.pwndbg.re/useragent"
 	"github.com/sirupsen/logrus"
 	"github.com/ulikunitz/xz"
 	"golang.org/x/sync/errgroup"
@@ -65,7 +66,11 @@ func NewNixDebuginfo(logger *logrus.Entry) *NixDebuginfo {
 		cachePath:        cachePath,
 		nixSubstituteUrl: *u2,
 		logger:           logger,
-		client:           http.DefaultClient, // TODO: moze trzeba inne limity na timout na nagłówki ustawic lub inne limity
+		// Wrapped so every request to cache.nixos.org identifies us: this used
+		// to be http.DefaultClient and went out as Go-http-client/2.0, with no
+		// way for the nix infrastructure to tell whose traffic it was.
+		// TODO: moze trzeba inne limity na timout na nagłówki ustawic lub inne limity
+		client: useragent.Client(http.DefaultClient, "nix"),
 	}
 }
 

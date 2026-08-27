@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
+	"github.com/pwndbg/debuginfod.pwndbg.re/useragent"
 )
 
 func testSrv(t *testing.T, h http.HandlerFunc) (*srv, *int64) {
@@ -22,7 +23,7 @@ func testSrv(t *testing.T, h http.HandlerFunc) (*srv, *int64) {
 	t.Cleanup(backend.Close)
 	return &srv{
 		debian:   backend.URL,
-		hc:       backend.Client(),
+		hc:       useragent.Client(backend.Client(), "deb"),
 		resolved: expirable.NewLRU[string, pkgRef](resolveCacheSize, nil, resolveCacheTTL),
 	}, &calls
 }
@@ -96,5 +97,31 @@ func TestResolveCoalescesConcurrentLookups(t *testing.T) {
 	wg.Wait()
 	if n := atomic.LoadInt64(calls); n != 1 {
 		t.Errorf("asked Debian %d times for one cold build ID, want 1", n)
+	}
+}
+
+// Every request this service makes to a third party has to identify the
+// project. It is checked here rather than trusted from the wiring because the
+// header is no longer set at the call site: if the client stops being wrapped,
+// nothing else fails, requests simply go out as Go-http-client and nobody
+// notices until an upstream blocks us.
+func TestOutboundRequestsIdentifyTheProject(t *testing.T) {
+	var got string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("User-Agent")
+		w.Header().Set("x-debuginfod-archive", glibcArchive)
+	}))
+	defer backend.Close()
+
+	s := &srv{
+		debian:   backend.URL,
+		hc:       useragent.Client(backend.Client(), "deb"),
+		resolved: expirable.NewLRU[string, pkgRef](resolveCacheSize, nil, resolveCacheTTL),
+	}
+	if _, err := s.resolve(context.Background(), "abc"); err != nil {
+		t.Fatal(err)
+	}
+	if want := useragent.String("deb"); got != want {
+		t.Errorf("User-Agent = %q, want %q", got, want)
 	}
 }

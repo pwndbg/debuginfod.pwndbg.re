@@ -138,6 +138,21 @@ decision that took a while to get right:
 | `TestRenderEscapesAttackerControlledLabels` (`cmd/releases`) | a filename is client-supplied, stored verbatim and rendered as a bar label — the escaping is the only thing between a crafted request and stored XSS |
 | `TestClientIPTrustsHeaderOnlyFromLoopback` (`cmd/releases`) | `CF-Connecting-IP` is believed only from the tunnel, never from a routable peer |
 
+**Every outbound HTTP request goes through `useragent.Client`.** The header is set in a
+RoundTripper, not by callers, because setting it at call sites has failed twice: the proxy's
+resolution probes went out as `Go-http-client/2.0` until someone noticed, and `nix/` used
+`http.DefaultClient` with no User-Agent at all for every request to `cache.nixos.org`. A component
+name (`nix`, `deb`, `deb-unpack`) tells an upstream operator which of our services is calling.
+`cmd/proxy` keeps its own equivalent, `newUpstreamRequest`, which both `Fetch` and `Probe` go
+through for the same reason.
+
+**`buildcheck/` tests how the repository is assembled, not what it does.** It asks the toolchain
+what each Dockerfile's binary imports and fails if the Dockerfile does not `COPY` that package, and
+checks `sync.sh` sends it. That failure is remote-only — the image builds locally from the module
+cache and its `COPY` fails on the host — and it has happened twice, with `srcindex/` and
+`useragent/`. Both lists are explicit rather than globs, so adding a top-level package is a step
+that is easy to forget; this is what remembers.
+
 Four small interfaces exist purely so tests can avoid ClickHouse: `accessLogger`
 (`context.go`), `stateStore` (`finder.go`), `statsSource` (`stats.go`) and `cacheStatStore`
 (`cachestat.go`). `*dbSrv` satisfies all four implicitly.
