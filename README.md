@@ -41,7 +41,10 @@ This proxy solves that: point your debugger at **one** URL and every build-id lo
 - **opensuse** — answers on demand: the first request for a build id returns 404 and the same
   request succeeds minutes later, so a miss does not mean the build id is absent. It sends no
   `x-debuginfod-*` headers at all, which is also why the IMA column cannot be read for it.
-- **debian** — serves no sources of its own; we serve them, see below.
+- **debian** — serves no sources of its own; we serve them, see below. Note this needs a client
+  that can ask for them: Debian records **relative** source paths in DWARF (`./csu` plus
+  `../sysdeps/x86/abi-note.c`), and GNU `libdebuginfod` only handles absolute ones, so it never
+  sends the request. [debuginfod-zig](https://github.com/pwndbg/debuginfod-zig) handles both.
 
 **IMA sig** is the `x-debuginfod-imasignature` header, used to verify what you downloaded. Only the
 Red Hat family sends it.
