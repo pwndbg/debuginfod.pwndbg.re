@@ -18,17 +18,30 @@ This proxy solves that: point your debugger at **one** URL and every build-id lo
 
 ## Upstream servers
 
-| Name       | URL                                         | debuginfo | executable | source | IMA sig | Old build ids | Notes |
-| ---------- | ------------------------------------------- | :-------: | :--------: | :----: | :-----: | ------------- | ----- |
-| systemtap  | https://debuginfod.systemtap.org            |     ✅     |     ✅      |   ✅    |    ✅    | kept          |       |
-| fedora     | https://debuginfod.fedoraproject.org        |     ✅     |     ✅      |   ✅    |    ✅    | kept          |       |
-| centos     | https://debuginfod.centos.org               |     ✅     |     ✅      |   ✅    |    ✅    | kept          |       |
-| opensuse   | https://debuginfod.opensuse.org             |     ✅     |     ❌      |   ✅    |    ❔    | expire        | answers on demand — the first request for a build id returns 404 and the same request succeeds minutes later; sends no `x-debuginfod-*` headers |
-| archlinux  | https://debuginfod.archlinux.org            |     ✅     |     ❌      |   ✅    |    ❌    | expire        |       |
-| artixlinux | https://debuginfod.artixlinux.org           |     ✅     |     ❌      |   ✅    |    ❌    | expire        |       |
-| cachyos    | https://debuginfod.cachyos.org              |     ✅     |     ❌      |   ✅    |    ❌    | expire        |       |
-| debian     | https://debuginfod.debian.net               |     ✅     |     ❌      |   ✅    |    ❌    | expire        | serves no sources of its own — we serve them, see below |
-| nix        | our own debuginfod server for nix / nixpkgs |     ✅     |     ✅      |   ✅    |    ❌    | kept          |       |
+| Name       | URL                                         | debuginfo | executable | source | IMA sig | Old build ids |
+| ---------- | ------------------------------------------- | :-------: | :--------: | :----: | :-----: | ------------- |
+| systemtap  | https://debuginfod.systemtap.org            |     ✅     |     ✅      |   ✅    |    🟡    | kept          |
+| fedora     | https://debuginfod.fedoraproject.org        |     ✅     |     ✅      |   ✅    |    ✅    | kept          |
+| centos     | https://debuginfod.centos.org               |     ✅     |     ✅      |   ✅    |    ✅    | kept          |
+| opensuse   | https://debuginfod.opensuse.org             |     ✅     |     ❌      |   ✅    |   ❌🟡   | expire        |
+| archlinux  | https://debuginfod.archlinux.org            |     ✅     |     ❌      |   ✅    |    ❌    | expire        |
+| artixlinux | https://debuginfod.artixlinux.org           |     ✅     |     ❌      |   ✅    |    ❌    | expire        |
+| cachyos    | https://debuginfod.cachyos.org              |     ✅     |     ❌      |   ✅    |    ❌    | expire        |
+| debian     | https://debuginfod.debian.net               |     ✅     |     ❌      |  ✅🟡   |    ❌    | expire        |
+| nix        | our own debuginfod server for nix / nixpkgs |     ✅     |     ✅      |   ✅    |    ❌    | kept          |
+
+🟡 means there is something to know about that cell:
+
+- **systemtap** — an experimental server run by the elfutils authors, not a distribution's. It holds
+  a partial x86-64 copy of fedora / centos / ubuntu / debian content — kernel, glibc, coreutils and a
+  few more, late 2019 onwards — with no uptime guarantee
+  ([announcement](https://sourceware.org/legacy-ml/systemtap/2020-q1/msg00002.html)). Its IMA
+  signatures come with the fedora and centos packages it copied, so only part of what it serves has
+  them.
+- **opensuse** — answers on demand: the first request for a build id returns 404 and the same
+  request succeeds minutes later, so a miss does not mean the build id is absent. It sends no
+  `x-debuginfod-*` headers at all, which is also why the IMA column cannot be read for it.
+- **debian** — serves no sources of its own; we serve them, see below.
 
 **IMA sig** is the `x-debuginfod-imasignature` header, used to verify what you downloaded. Only the
 Red Hat family sends it.
