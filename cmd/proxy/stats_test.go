@@ -795,3 +795,33 @@ func TestProbePanelSaysNothingWhenNobodyWasProbed(t *testing.T) {
 		t.Error("the page marks hosts offline on a day when nothing was probed")
 	}
 }
+
+// A source delegate serves traffic but is never probed, by design: it is kept
+// out of the servers map because it answers 501 to the debuginfo probe that
+// every resolution sends. It therefore appears in access_log.resolved_host and
+// never in resolve_logs - and "not probed in 24 h" must not read as an outage
+// for something that was never in the rotation.
+func TestOfflineBadgeIgnoresHostsThatWereNeverProbed(t *testing.T) {
+	s := sampleSnapshot(30)
+
+	// A delegate: traffic, no probe history.
+	s.Traffic["debian-src"] = s.Traffic["fedora"]
+	s.Hosts = append(s.Hosts, "debian-src")
+
+	if s.isOffline("debian-src") {
+		t.Error("a host that was never probed is reported offline")
+	}
+	// The real case still works: elfutils has history and no recent probes.
+	if !s.isOffline("elfutils") {
+		t.Error("a host that stopped being probed is no longer detected")
+	}
+
+	page := string(renderStats(s))
+	i := strings.Index(page, "debian-src")
+	if i < 0 {
+		t.Fatal("the delegate is not on the page at all")
+	}
+	if k := strings.Index(page[i:], `class="off"`); k >= 0 && k < 120 {
+		t.Error("the delegate is badged offline although it is working")
+	}
+}

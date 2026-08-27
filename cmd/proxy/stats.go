@@ -604,8 +604,18 @@ func (s *dbSrv) collectProbeRecent(ctx context.Context, snap *statsSnapshot) err
 //   - unresolvedLabel is not a host. It stands in for an empty resolved_host -
 //     the request never reached an upstream - so it is never probed and would
 //     otherwise be marked offline on every page load.
+//   - A host with no probe history AT ALL was never in the probe rotation, so
+//     "stopped being probed" says nothing about it. Source delegates are the
+//     case: cmd/deb-debuginfod serves /source/* for build IDs debian resolved,
+//     and is deliberately kept out of the servers map because it answers 501 to
+//     the debuginfo probe every resolution would send it. It appears in
+//     access_log.resolved_host and nowhere in resolve_logs, and without this
+//     it would be badged offline on every page while working perfectly.
 func (s *statsSnapshot) isOffline(host string) bool {
 	if s.ProbeRecentTotal == 0 || host == "" || host == unresolvedLabel {
+		return false
+	}
+	if _, everProbed := s.Probes[host]; !everProbed {
 		return false
 	}
 	return s.ProbeRecent[host] == 0

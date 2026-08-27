@@ -30,6 +30,13 @@ type Server struct {
 	URL             string
 	SourceAvailable int
 	Down            bool
+
+	// SourceVia names a delegate that serves /source/* for build IDs this
+	// server resolves but cannot supply sources for. debuginfod.debian.net is
+	// the case it exists for: it answers debuginfo and executable well and
+	// 404s every source path, so without a delegate every Debian source
+	// request is a 501.
+	SourceVia string
 }
 
 // stateStore rather than *dbSrv, so the finder tests need no ClickHouse.
@@ -47,6 +54,7 @@ type DebugInfoFinder struct {
 	client           *http.Client
 	localFetchClient *http.Client
 	servers          map[string]*Server
+	delegates        map[string]*Server
 	// The cache holds VALUES, not pointers - so Get hands back an immutable copy
 	// and the fast path in FindByBuildID can read state without synchronisation,
 	// even while a resolution for the same build ID is running in the background.
@@ -163,6 +171,18 @@ func NewDebugInfoFinder(db stateStore) *DebugInfoFinder {
 		db:               db,
 		client:           &http.Client{Transport: newTransport(responseHeaderTimeout)},
 		localFetchClient: &http.Client{Transport: newTransport(fetchHeaderTimeout)},
+		// delegates are deliberately NOT in the servers map. tryAllServers probes
+		// every entry there with /buildid/<id>/debuginfo, and a source-only
+		// backend answers 501 to that - so it would be probed on every cold
+		// build ID, fail every time, and appear in resolve_logs and on /stats
+		// as a backend with a 0% success rate. It resolves nothing; it only
+		// serves sources for build IDs another server has already resolved.
+		delegates: map[string]*Server{
+			// cmd/deb-debuginfod: plain HTTP, unlike the nix backend, because
+			// nothing here needs HTTP/2 - there are no Early Hints to send when
+			// the answer is a small text file.
+			"debian-src": {Name: "debian-src", Down: false, SourceAvailable: 1, URL: "http://127.0.0.1:8036"},
+		},
 		servers: map[string]*Server{
 			//{Name: "elfutils", URL: "https://debuginfod.elfutils.org"},  // bugged
 			"systemtap":  {Name: "systemtap", Down: false, SourceAvailable: 1, URL: "https://debuginfod.systemtap.org"},
@@ -172,7 +192,7 @@ func NewDebugInfoFinder(db stateStore) *DebugInfoFinder {
 			"artixlinux": {Name: "artixlinux", Down: false, SourceAvailable: 1, URL: "https://debuginfod.artixlinux.org"},
 			"cachyos":    {Name: "cachyos", Down: false, SourceAvailable: 1, URL: "https://debuginfod.cachyos.org"}, // untested source
 			"centos":     {Name: "centos", Down: false, SourceAvailable: 1, URL: "https://debuginfod.centos.org"},
-			"debian":     {Name: "debian", Down: false, SourceAvailable: 0, URL: "https://debuginfod.debian.net"},
+			"debian":     {Name: "debian", Down: false, SourceAvailable: 0, URL: "https://debuginfod.debian.net", SourceVia: "debian-src"},
 			"ubuntu":     {Name: "ubuntu", Down: true, SourceAvailable: 0, URL: "https://debuginfod.ubuntu.com"},
 			//"alpine":     {Name: "alpine", Down: false, SourceAvailable: 0, URL: "https://debuginfod.achill.org"}, // offline
 			// https, and on 8034: cmd/nix-debuginfod serves TLS so that HTTP/2 -
@@ -482,12 +502,12 @@ func (f *DebugInfoFinder) FindByBuildID(ctx context.Context, buildID string, end
 		if !ok {
 			log.WithField("build_id", buildID).WithField("host", state.LastHost).
 				Warn("FindByBuildID found host in db, but not in code")
-			return applySourceRules(endpointName, nil, ErrDebuginfoNotFound)
+			return f.applySourceRules(endpointName, nil, ErrDebuginfoNotFound)
 		}
 		if host.Down {
 			return nil, stderrors.Join(fmt.Errorf("host %s is down", host.Name), ErrDebuginfodTemporaryDown)
 		}
-		return applySourceRules(endpointName, host, nil)
+		return f.applySourceRules(endpointName, host, nil)
 	}
 
 	// Slow path: the upstreams have to be asked.
@@ -501,7 +521,7 @@ func (f *DebugInfoFinder) FindByBuildID(ctx context.Context, buildID string, end
 	select {
 	case res := <-chRes:
 		server, _ := res.Val.(*Server)
-		return applySourceRules(endpointName, server, res.Err)
+		return f.applySourceRules(endpointName, server, res.Err)
 	case <-ctx.Done():
 		// timeout, return normal 500 error
 
@@ -511,7 +531,11 @@ func (f *DebugInfoFinder) FindByBuildID(ctx context.Context, buildID string, end
 
 // applySourceRules - special case for source handling, for better caching by buildid.
 // Shared by the fast and slow paths so the two cannot drift apart later.
-func applySourceRules(endpointName string, server *Server, err error) (*Server, error) {
+//
+// A method rather than a free function because of the delegate lookup: the
+// resolving server and the server that serves the sources need not be the same
+// one, and only the finder knows the delegates.
+func (f *DebugInfoFinder) applySourceRules(endpointName string, server *Server, err error) (*Server, error) {
 	if endpointName != "source" {
 		return server, err
 	}
@@ -519,6 +543,13 @@ func applySourceRules(endpointName string, server *Server, err error) (*Server, 
 		return server, stderrors.Join(ErrSourceNotImplemented, err)
 	}
 	if err == nil && server.SourceAvailable == 0 {
+		// The build ID resolved, so we know which distribution it belongs to -
+		// we simply cannot get sources from that upstream. A delegate that can
+		// is not a fallback guess: it is told the same build ID and looks the
+		// package up the same way the upstream would have.
+		if via, ok := f.delegates[server.SourceVia]; ok && !via.Down {
+			return via, nil
+		}
 		return server, ErrSourceNotImplemented
 	}
 	return server, err

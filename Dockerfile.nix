@@ -15,6 +15,8 @@ COPY cmd/ ./cmd
 # The nix/ package, which cmd/nix-debuginfod imports. The other two Dockerfiles copy
 # cmd/ alone because nothing they build needs it; this one does.
 COPY nix/ ./nix
+# cmd/nix-debuginfod shares its source-path matcher with cmd/deb-debuginfod.
+COPY srcindex/ ./srcindex
 
 RUN CGO_ENABLED=0 GOOS=linux go build -o /app/nix.bin ./cmd/nix-debuginfod/
 

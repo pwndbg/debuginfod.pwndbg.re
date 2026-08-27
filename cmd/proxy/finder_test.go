@@ -71,7 +71,8 @@ func TestApplySourceRules(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := applySourceRules(tc.endpoint, tc.server, tc.err)
+			f := &DebugInfoFinder{}
+			_, err := f.applySourceRules(tc.endpoint, tc.server, tc.err)
 			if tc.wantNilErr {
 				if err != nil {
 					t.Fatalf("oczekiwano nil, dostano %v", err)
@@ -88,7 +89,8 @@ func TestApplySourceRules(t *testing.T) {
 // A 404 turned into 501 for /source must keep the original cause, so it stays
 // recognisable in the logs.
 func TestApplySourceRulesKeepsUnderlyingCause(t *testing.T) {
-	_, err := applySourceRules("source", nil, ErrDebuginfoNotFound)
+	f := &DebugInfoFinder{}
+	_, err := f.applySourceRules("source", nil, ErrDebuginfoNotFound)
 	if !stderrors.Is(err, ErrSourceNotImplemented) {
 		t.Error("zgubiono ErrSourceNotImplemented")
 	}
@@ -502,4 +504,79 @@ func TestUpstreamRequestsIdentifyThisProxy(t *testing.T) {
 			t.Errorf("sonda: accept-encoding=%q, oczekiwano %q", got.ae, upstreamAcceptEncoding)
 		}
 	})
+}
+
+// A host that resolves build IDs but has no sources of its own hands /source/*
+// to a delegate instead of answering 501.
+//
+// The delegate is deliberately absent from the servers map: tryAllServers
+// probes every entry there with /buildid/<id>/debuginfo, and a source-only
+// backend answers 501 to that - so it would be probed on every cold build ID,
+// fail every time, and show up on /stats as a backend with a 0% success rate.
+func TestApplySourceRulesRoutesToADelegate(t *testing.T) {
+	delegate := &Server{Name: "debian-src", SourceAvailable: 1, URL: "http://127.0.0.1:8036"}
+	debian := &Server{Name: "debian", SourceAvailable: 0, URL: "https://debuginfod.debian.net", SourceVia: "debian-src"}
+	f := &DebugInfoFinder{delegates: map[string]*Server{"debian-src": delegate}}
+
+	got, err := f.applySourceRules("source", debian, nil)
+	if err != nil {
+		t.Fatalf("expected the delegate to take it, got %v", err)
+	}
+	if got != delegate {
+		t.Fatalf("routed to %+v, want the delegate", got)
+	}
+
+	// Other endpoints must still go to the resolving upstream: the delegate
+	// serves sources only and answers 501 to anything else.
+	for _, ep := range []string{"debuginfo", "executable"} {
+		got, err := f.applySourceRules(ep, debian, nil)
+		if err != nil || got != debian {
+			t.Errorf("%s went to %+v (err %v), want debian", ep, got, err)
+		}
+	}
+}
+
+// Without a delegate, or with one marked down, the old behaviour stands: a 501
+// that stays cacheable per build ID rather than a 500 nobody can act on.
+func TestApplySourceRulesFallsBackTo501(t *testing.T) {
+	debian := &Server{Name: "debian", SourceAvailable: 0, SourceVia: "debian-src"}
+
+	for name, f := range map[string]*DebugInfoFinder{
+		"no delegates configured": {},
+		"delegate is down": {delegates: map[string]*Server{
+			"debian-src": {Name: "debian-src", SourceAvailable: 1, Down: true},
+		}},
+		"delegate named but missing": {delegates: map[string]*Server{"other": {Name: "other"}}},
+	} {
+		if _, err := f.applySourceRules("source", debian, nil); !stderrors.Is(err, ErrSourceNotImplemented) {
+			t.Errorf("%s: got %v, want ErrSourceNotImplemented", name, err)
+		}
+	}
+}
+
+// The real map, not a fixture: debian has to name a delegate that actually
+// exists, and the delegate must not be in the servers map.
+func TestDelegateWiringIsConsistent(t *testing.T) {
+	f := NewDebugInfoFinder(nil)
+	for name, srv := range f.servers {
+		if srv.SourceVia == "" {
+			continue
+		}
+		if _, ok := f.delegates[srv.SourceVia]; !ok {
+			t.Errorf("%s delegates sources to %q, which is not configured", name, srv.SourceVia)
+		}
+	}
+	for name, d := range f.delegates {
+		if _, ok := f.servers[name]; ok {
+			t.Errorf("delegate %q is also in the servers map; it would be probed and always fail", name)
+		}
+		// A delegate must be on loopback, and not merely as a deployment
+		// preference. fetchClientFor gives loopback the client with NO response
+		// header timeout, which a source backend needs: it writes headers only
+		// after unpacking a source package, seconds or minutes in. A remote
+		// delegate would be cut off at the 5 s limit on every cold package.
+		if got := f.fetchClientFor(d.URL); got != f.localFetchClient {
+			t.Errorf("delegate %q at %s does not get the no-header-timeout client", name, d.URL)
+		}
+	}
 }

@@ -4,10 +4,7 @@ go 1.26.7
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.48.0
-	github.com/blakesmith/ar v0.0.0-20190502131153-809d4375e1fb
 	github.com/caarlos0/env/v11 v11.4.1
-	github.com/erofs/go-erofs v0.3.1
-	github.com/gorilla/mux v1.8.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/julienschmidt/httprouter v1.3.0
 	github.com/klauspost/compress v1.19.2

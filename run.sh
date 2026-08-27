@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 #   ./run.sh          rebuild and recreate the proxy only - the usual redeploy
-#   ./run.sh --all    also ClickHouse, the releases service and the nix backend
+#   ./run.sh --deb    only the Debian source backend (unpacker + server)
+#   ./run.sh --all    also ClickHouse, releases, the nix backend and the Debian one
 #
 set -euo pipefail
 
@@ -78,6 +79,47 @@ nix() {
     "pwndbg-debuginfod-nix2"
 }
 
+deb() {
+  # Two containers on purpose. dpkg-source is what applies Debian's quilt
+  # series - for glibc that is 94 patches touching 666 files, elf/rtld.c among
+  # them by 97 lines - and serving pristine sources there would show a debugger
+  # the wrong lines, silently. dpkg-source needs dpkg-dev, so it lives in its
+  # own debian:13-slim image and the serving container stays distroless.
+  docker build -f Dockerfile.deb-unpack -t "pwndbg-deb-unpack" .
+  docker build -f Dockerfile.deb-debuginfod -t "pwndbg-deb-debuginfod" .
+
+  # Both mount the same volume: the unpacker writes trees, the server reads
+  # them. The server also drives eviction and calls back to the unpacker to do
+  # the deleting, because only the unpacker mounts the volume writable.
+  #
+  # 20 GiB is roughly 80 source packages at glibc's 251 MB, and far more at a
+  # typical package's size. Rebuilding one costs ~2 s, so being wrong here is
+  # cheap in a way it is not for the nix backend.
+  docker rm -f "pwndbg-deb-unpack" 2>/dev/null || true
+  docker run -d \
+    --name "pwndbg-deb-unpack" \
+    --restart unless-stopped \
+    --network host \
+    -e LISTEN_ADDR=127.0.0.1:8035 \
+    -e UNPACK_PATH=/var/lib/deb-src \
+    -v "deb_src:/var/lib/deb-src" \
+    "pwndbg-deb-unpack"
+
+  # :ro deliberately - this service only reads and indexes. The unpacker is the
+  # single writer, so a mistake in the serving code cannot corrupt the cache.
+  docker rm -f "pwndbg-deb-debuginfod" 2>/dev/null || true
+  docker run -d \
+    --name "pwndbg-deb-debuginfod" \
+    --restart unless-stopped \
+    --network host \
+    -e LISTEN_ADDR=127.0.0.1:8036 \
+    -e UNPACKER_URL=http://127.0.0.1:8035 \
+    -e CACHE_MAX_BYTES=21474836480 \
+    -e EVICT_INTERVAL=10m \
+    -v "deb_src:/var/lib/deb-src:ro" \
+    "pwndbg-deb-debuginfod"
+}
+
 case "${1:-}" in
   "")
     proxy
@@ -88,18 +130,22 @@ case "${1:-}" in
   --nix)
     nix
     ;;
+  --deb)
+    deb
+    ;;
   --all)
     clickhouse
     proxy
     releases
     nix
+    deb
     ;;
   -h | --help)
-    sed -n '2,5p' "$0"
+    sed -n '2,6p' "$0"
     ;;
   *)
     echo "unknown option: $1" >&2
-    sed -n '2,5p' "$0" >&2
+    sed -n '2,6p' "$0" >&2
     exit 2
     ;;
 esac

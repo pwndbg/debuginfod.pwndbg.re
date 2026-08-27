@@ -1,0 +1,20 @@
+# The only image in this repo that needs dpkg-dev, which is the whole reason
+# cmd/deb-unpack is a separate service: dpkg-source is what applies Debian's
+# quilt series, and serving pristine sources instead would show a debugger the
+# wrong lines. It costs 20 packages and ~94 MB, and it stays out of the serving
+# container.
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ ./cmd
+RUN CGO_ENABLED=0 go build -o /out/deb-unpack ./cmd/deb-unpack
+
+FROM debian:13-slim
+# dpkg-dev is a RUNTIME dependency: cmd/deb-unpack log.Fatal()s without
+# dpkg-source rather than discovering it per request.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends dpkg-dev ca-certificates xz-utils bzip2 \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/deb-unpack /usr/local/bin/deb-unpack
+ENTRYPOINT ["/usr/local/bin/deb-unpack"]

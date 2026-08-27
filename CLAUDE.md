@@ -40,18 +40,48 @@ Not everything in `cmd/` builds. `go build ./...` currently fails:
   one thing it did that singleflight does not, capping how many *distinct* paths build at once,
   came back as a semaphore in `buildOnce`: a bound, not a queue, because a queue would also have to
   answer what happens when it fills.
-- **`cmd/indexer`** — **does not compile** (the only package that still doesn't). `main.go` is one big comment block that gets terminated
-  early by a `'*/'` inside an rsync example, and `deb.go` declares a second `main`. Debian indexing
-  is a scratchpad, not a service.
+- **`cmd/indexer`** — builds and has tests; **nothing serves from its output yet**. It walks
+  `astral-sh/python-build-standalone` releases and records which asset holds the debug info for a
+  given build ID, into `pbs_buildids` + `pbs_assets`. It exists because uv downloads the
+  **`install_only_stripped`** tarballs: those binaries keep `.note.gnu.build-id` — stripping does
+  not touch it — but carry no DWARF, and no distro debuginfod knows the IDs, since these are
+  astral's builds. The `install_only` asset of the same release has the same binaries unstripped,
+  at the same member paths, with the same IDs. Verified on 3.14.7+20260825: `python3.14` is
+  `64c83ec8…d750` in both, 32 MB stripped against 116 MB with `.debug_info`, and all 9 build IDs
+  agree across the two assets (`TestStrippedAndFullShareBuildIDs`, needs local tarballs).
+  It used to be a Debian `.deb` scratchpad; that direction was dropped because `debuginfod.debian.net`
+  already covers Debian debuginfo, and the one gap it does not cover — `/source/*` — is in `.dsc`
+  and `.orig.tar.xz`, not in a `.deb`.
+- **`cmd/deb-debuginfod`** + **`cmd/deb-unpack`** — build, have tests, verified end to end; **not
+  deployed**. They serve `/buildid/<id>/source/*` for Debian build IDs and nothing else, because
+  `debuginfod.debian.net` already does debuginfo and executable well but returns 404 for every
+  source path — which is why `cmd/proxy` carries `SourceAvailable: 0` for debian and answers 501.
+  Measured on production: `/source` succeeds for 1.1% of requests, and 1,843 of 3,641 in a week
+  were that 501.
 - **`cmd/debug-nar`** — builds; a personal scratch harness for poking at erofs images, with most of
   `main` commented out and hardcoded `/root/.cache/...` paths.
 
-`cmd/proxy`, `cmd/releases` and `cmd/nix-nar-old` have tests; the other packages have none.
-Because `cmd/indexer` doesn't compile, **`go test ./...` fails** — run the suites as:
+`cmd/proxy`, `cmd/releases`, `cmd/nix-nar-old` and `cmd/indexer` have tests; the other packages have
+none. Every package compiles, so `go test ./...` works — but prefer naming the suites, since the
+whole-module run buys nothing:
 
 ```bash
-go test ./cmd/proxy ./cmd/releases ./cmd/nix-nar-old -race   # ~3s, no external dependencies
+go test ./cmd/proxy ./cmd/releases ./cmd/nix-nar-old ./cmd/indexer -race   # ~5s, no external deps
 ```
+
+`cmd/indexer`'s two heaviest tests are skipped unless pointed at local tarballs
+(`PBS_TEST_TARBALL`, `PBS_TEST_TARBALL_STRIPPED`) — the synthetic archives cannot catch a change in
+how the release pipeline lays assets out.
+
+**A build-ID note is not near the front of the file.** `BuildIDFromELF` streams forward and takes
+the stream length from the tar entry header, because python-build-standalone links its interpreters
+so `PT_NOTE` lands at the *end*: `python3.10` is 46 MB with its note segment at `0x2c3d0a8`, 66 kB
+before EOF. The first version capped the forward scan at 16 MiB on the theory that notes follow the
+program headers, and so silently dropped exactly the build ID a user is most likely to want — the
+interpreter's own — while still returning the nine ids of the shared libraries around it, which is
+what made it look like it worked. `TestBuildIDFromELFFindsNoteAtEndOfFile` pins it. Reading to the
+end of an entry costs nothing extra anyway: `tar.Reader` has to stream past it to reach the next
+header.
 
 `cmd/nix-nar-old`'s tests exist for one reason: its handler passes the `ResponseWriter`
 straight to `Get`, so a failure *after* the first byte cannot change the status. It used to
@@ -185,6 +215,9 @@ production values:
 | `STATS_DAYS` | `360` | longest `/stats` window; the 7/30/180 d views are sliced from the same data |
 | `STATS_INTERVAL` | `1h` | background rebuild period; the handler never queries ClickHouse |
 | `CACHE_STATS_INTERVAL` | `10m` | how often `CACHE_PATH` is measured into `cache_stats` |
+| `GH_RANGES_ENABLED` | `true` | refreshes `github_ip_ranges` from `api.github.com/meta`; **false does not remove the `/stats` filter**, it only stops updating what the filter reads |
+| `GH_RANGES_INTERVAL` | `24h` | the ranges are Azure allocations that move on the scale of weeks |
+| `GH_RANGES_SERVICES` | `actions` | comma-separated `meta` keys; `actions_macos` is separate and not included |
 
 `cmd/releases` reads `CLICKHOUSE_DSN`, `LOG_LEVEL` and the same `STATS_ENABLED` / `STATS_DAYS`
 (360) / `STATS_INTERVAL` (1h) trio; it hardcodes `127.0.0.1:8033`.
@@ -242,6 +275,46 @@ map degrades to a 404 with a warning log.
 only when `RemoteAddr` falls inside a prefix fetched from the Cloudflare IPs API (refreshed via a
 background worker, lazily initialized through a `sync.Once` singleton).
 
+**CI classification** (`ghranges.go`): `/stats` is meant to describe people, and a workflow that
+installs pwndbg on every push is not one. Measured on production, **89% of all traffic is GitHub
+Actions** — 12.05M of 13.48M rows — so this is not a rounding correction. A daily worker fetches
+`api.github.com/meta`, keeps the `actions` prefixes in an in-process `ipTagSet`, and
+`AccessLogMiddleware` tags each request as it is logged. `country` is filled the same way, from
+`CF-IPCountry`, trusted only from a Cloudflare peer exactly like `CF-Connecting-IP`.
+
+**The row's own tags are the only input to the filter** — `excludeCI` is just
+`NOT has(tags, 'github_actions')`. There used to be a second mechanism, an `ip_trie` dictionary in
+ClickHouse consulted for rows that predated tagging, and it was **removed** once
+`scripts/backfill_tags.py` had classified every one of them. Do not reintroduce it as a general
+safety net: matching an old row against today's ranges reattributes traffic every time GitHub hands
+a prefix back to Azure, which is exactly why the decision is recorded per row rather than
+recomputed.
+
+`tags` therefore has three values and the third is the point:
+
+| value | meaning |
+|---|---|
+| `github_actions` | matched the range list as it stood when the request arrived |
+| `direct` | checked against that list and did not match |
+| `unclassified` | could not be checked — the list had never loaded |
+
+`unclassified` exists because the dictionary is gone and nothing can reconstruct the answer later.
+It is a tag rather than an empty array so the gap is *countable*: one query says how many rows are
+affected and `scripts/backfill_tags.py` repairs precisely those. An empty array would be
+indistinguishable from a pre-tagging row, and after the backfill there are none of those left.
+`/stats` **counts** `unclassified` rows rather than dropping them — the conservative direction, so
+a gap shows up as ordinary traffic instead of silently vanishing.
+
+The window is normally milliseconds: `Worker` refreshes before the first tick and retries every
+`retryUntilLoaded` (15 s) until it has succeeded once, rather than waiting out the 24 h interval —
+otherwise an unreachable GitHub at startup would cost a day of unclassified rows.
+
+`ipTagSet` buckets prefixes by mask length instead of scanning them, because `cfip.go`'s linear
+scan is right for thirty Cloudflare ranges and wrong for seven thousand on the hot path.
+
+Filtering only covers `access_log`. `collectProbes` reads `resolve_logs`, which has no `remote_ip`,
+so upstream probe counts still include probes triggered by CI requests.
+
 **Error → status mapping** happens in `AccessLogMiddleware`, not in handlers: handlers return
 `error`, the middleware maps `ErrSourceNotImplemented`→501, `ErrDebuginfoNotFound`→404, anything
 else→500, then writes the access log with a fresh `context.Background()` (the request context is
@@ -277,10 +350,67 @@ the previous page — a ClickHouse blip should give stale numbers, not a 503. De
 wrapped in `AccessLogMiddleware`: the page renders `access_log`, so logging its own hits would
 fold page views into the numbers on display. `statsSource` is the third test-only interface,
 alongside `accessLogger` and `stateStore`, and exists so the render tests need no ClickHouse.
-Two drawing decisions are load-bearing and have tests: `aborted` and `5xx` are under 0.02% of
-traffic so they also get per-day ticks below the axis (`TestTrafficPanelMarksRareCategories`),
-and a series with no samples draws nothing rather than a band lying on the axis, which would
-read as a measured zero (`TestBandPanelSkipsEmptySeries`).
+Three drawing decisions are load-bearing and have tests: `aborted` and `5xx` are under 0.02% of
+traffic so they also get per-day ticks below the axis (`TestTrafficPanelMarksRareCategories`);
+a series with no samples draws nothing rather than a band lying on the axis, which would
+read as a measured zero (`TestBandPanelSkipsEmptySeries`); and the country panel's folded tail is
+a line, never a bar (`TestCountryTailIsNotDrawnAsABar`).
+
+**Offline upstreams** (`collectProbeRecent`, `offlineHosts`): `tryAllServers` probes *every*
+configured upstream on every cold build ID, so a host still in the `servers` map cannot go a day
+without rows in `resolve_logs`. Worth knowing *why* that holds, because the obvious reading of
+`tryAllServers` says otherwise: `ResolveLog` is called once, inside `case res, ok := <-ch`, and it
+copies `entries` at the instant a winner arrives — probes still in flight append afterwards and are
+dropped (there is a `TODO: move this to the background` on that line). On a resolution that fails
+everywhere, though, `close(ch)` happens only after `errCounter.Add(1) == maxErrors`, and the append
+precedes that increment, so every host is recorded. Since ~94% of traffic resolves to nothing, that
+path alone gives complete daily coverage. The dropped entries do under-count probes for a
+consistently slow host, which is a `resolve_logs` accuracy problem in its own right.
+
+Zero probes in the last 24 h therefore means the host was removed from
+that map — `elfutils` and `alpine` are commented out there — and an `offline` badge goes beside its name. It is still charted, because it still has history.
+
+**The badge belongs to every panel that names a host** — traffic, bytes, probes and throughput, all
+four. `isOffline` is a predicate on the snapshot rather than a precomputed set for exactly that
+reason: the first version marked the probes panel only, and the same upstream then read as live in
+one section and dead in the next. `offlineBadge` is likewise one piece of markup shared by all four
+call sites. `TestProbePanelMarksUnprobedHostsOffline` walks each section by heading and fails if any
+one of them omits it — verified by reverting each panel in turn.
+
+**Two guards, both load-bearing.** `isOffline` returns false for everything when
+`ProbeRecentTotal` is zero: nobody being probed is the signature of a night with no cold build IDs,
+not of twelve simultaneous outages, and a page announcing the latter would be worse than one saying
+nothing (`TestProbePanelSaysNothingWhenNobodyWasProbed`). And it returns false for `unresolvedLabel`,
+which is not a host but the absence of one — it is never probed, so without the carve-out it would
+be reported offline on every page load. Note the badge does **not** catch
+`Down: true` — `tryAllServers` ignores that flag, so such a host is still probed and still looks
+live here. The query is a second, cheap pass rather than a `countIf` in the main probe query:
+`resolve_logs` is `ORDER BY (timestamp, buildid)`, so a one-day predicate reads one day of parts
+instead of the whole 360-day window.
+
+**Country panel** (`collectCountries`, `renderCountries`): a ranked bar list of where requests come
+from, with ~200 categories and a long tail — a comparison of magnitudes, not a shape over time.
+Points worth keeping:
+
+- Collected **per country per day**, not as one total each, because four views are sliced from one
+  collection and a total cannot be cut down to seven days. `sliceSnapshot` re-sorts afterwards: the
+  leader over 360 days need not lead over 7 (`TestSliceSnapshotRecomputesCountryOrder`).
+- Two numbers per row. Requests sum across days; **distinct clients do not**, so the second column
+  is the *peak* daily figure rather than a sum — a client active on thirty days would otherwise
+  count as thirty. It earns its place: production has countries sending tens of thousands of
+  requests from ten addresses.
+- The tail past `countryRows` (12) is a summary line. Its total routinely exceeds the leading
+  single country, so as a bar it rendered at 257% and `overflow:hidden` clipped it to full width,
+  making the residual look like the largest single origin. Only rendering the page showed this.
+- `country = ''` is dropped rather than shown as "unknown": after the backfill the only addresses
+  without one are `127.0.0.1` and the Docker bridge — this host talking to itself.
+- The panel carries the same endpoint and CI filters as the ones beside it
+  (`TestDBCollectCountriesFiltersLikeTheOtherPanels`). Without the CI filter it would be a map of
+  Azure regions rather than of users.
+- `flagFor` derives the flag emoji arithmetically and refuses anything that is not two ASCII
+  letters, including Cloudflare's `XX` and `T1`. `countryLabel` exists because there are two call
+  sites and the first version escaped only one of them — `country` comes from `CF-IPCountry`, so
+  that was a live injection point (`TestCountryPanelEscapesAttackerControlledLabels`).
 
 ### File cache (`filecache.go`)
 
@@ -542,6 +672,107 @@ things.
 `response_headers` in that table is always empty: the middleware reads `x-debuginfod-*` headers and
 no handler here sets any. Either start emitting them (the protocol has them) or drop the column.
 
+### Debian source backend (`cmd/deb-debuginfod` + `cmd/deb-unpack`, WIP)
+
+**No index of our own is needed, and that is the whole reason this is cheap.** `debuginfod.debian.net`
+answers `/buildid/<id>/debuginfo` with an `X-DEBUGINFOD-ARCHIVE` header naming the exact `.deb`:
+
+```
+/srv/mirror/debian-debug/dbg-main/g/glibc/libc6-dbg_2.41-12+deb13u3_amd64.deb
+```
+
+Mapping build IDs to packages is otherwise a mirror-sized job — it is what `cmd/indexer` was
+originally for — and Debian is already doing it. `parseArchive` turns that header into a source
+package. Two details come from real headers and are easy to get wrong: the component is `dbg-main`
+but the **sources** live in plain `main`, so the prefix is stripped; and the source package is the
+pool **directory** (`glibc`), never the binary name in the filename (`libc6-dbg`, which is also
+pre-`dbgsym` naming). A binNMU `+bN` suffix has no `.dsc` of its own and is stripped.
+
+**The sources must be patched, and this is not a detail.** Debian's 3.0 (quilt) format keeps the
+pristine tarball and a patch series side by side. For glibc 2.41-12+deb13u3 the series is 94 patches
+changing **666 source files**, `elf/rtld.c` among them by 97 lines — and `rtld.c` is a file clients
+really request. Serving pristine there shows a debugger the wrong lines, silently. `dpkg-source -x`
+does the whole job in 1.2 s; reimplementing quilt semantics in Go was considered and rejected, since
+a partial version fails on exactly the packages nobody tests.
+
+**That is why there are two commands.** `dpkg-source` needs `dpkg-dev` (20 packages, ~94 MB), so
+`cmd/deb-unpack` runs in `debian:13-slim` and owns it, while `cmd/deb-debuginfod` stays on a
+distroless image and talks to it over HTTP across a shared volume. Shelling out to `docker run`
+instead was rejected: it needs the docker socket, which is root on the host.
+
+- **All policy lives in the serving side.** The unpacker is stateless and does one thing,
+  `(package, version) → tree on the volume`. Caching, the index, coalescing and eviction belong to
+  `cmd/deb-debuginfod`, because two services with opinions about what is cached is how they start
+  disagreeing.
+- **Path matching is `srcindex`, shared with `cmd/nix-debuginfod`.** Necessary, not decorative:
+  clients join `DW_AT_comp_dir` with `DW_AT_name`, which for glibc produces `./elf/./elf/do-rel.h` —
+  a doubled component that normalisation alone resolves to a path that does not exist. Matching from
+  the right finds `elf/do-rel.h`. Verified against all four shapes seen in production logs.
+- **Build ID → package is cached** (`expirable.LRU`, 10k/24 h) and coalesced. Without it every
+  source request costs a round trip to Debian: measured **140 ms → 0.3 ms** warm. Failures are
+  deliberately **not** cached — a failure is usually "Debian was slow", and a 24 h TTL would turn a
+  blip into a day-long outage for that build ID.
+- `--no-check` skips the `.dsc` signature check. Deliberate: verifying needs the Debian keyring in
+  that image, and the bytes came over TLS from the archive that signed them. Revisit before pointing
+  this at an untrusted mirror.
+
+Measured on glibc: 20 MB of archives → **251 MB unpacked, 20,961 files**; cold request 2.7 s, warm
+0.3 ms.
+
+**Eviction is LRU by request, and the split between the services is the interesting part.** The
+serving container mounts the volume `:ro`, so it cannot delete — which is deliberate: the unpacker
+is the single writer, and a mistake in the serving code cannot corrupt the cache. So the server
+decides (it is the only one that sees traffic) and calls `DELETE /tree/{component}/{name}` on the
+unpacker to act. Two orderings are load-bearing and have tests:
+
+- The **index is dropped before the delete is requested**. The other way round leaves a window where
+  the index still offers paths whose files are gone, and every request in it 502s instead of paying
+  for a re-unpack.
+- The unpacker **renames before RemoveAll**, so a tree stops being visible instantly rather than
+  spending a moment existing with its done-marker and half its files. A reader holding it open is
+  fine: unlink keeps the data alive until the last descriptor closes.
+- The done-marker is written into the **staging** directory before the atomic rename, so a
+  package-named directory always implies a complete tree — there is no window in which a final name
+  exists without one. A directory that nonetheless lacks the marker came from somewhere else (a
+  restored backup, an older build) and `sweepStale` **reports it and leaves it alone**: it is
+  invisible to `/trees` and so never evicted, but deleting an operator's directory is the worse of
+  the two mistakes.
+
+Ordering is by last *request*, not mtime — mtime cannot tell a package fetched once from one serving
+a debugger all week — with mtime as the fallback for trees this process has never served, e.g. after
+a restart. A zero or negative budget **disables** eviction rather than emptying the volume, so a typo
+in the config does not delete everything on the first tick. Verified end to end: 297 MB on the
+volume, 200 MB budget, glibc evicted, 3.1 MB left, and the next request for it rebuilt in 2.1 s.
+
+`CACHE_MAX_BYTES` (20 GiB) and `EVICT_INTERVAL` (10 m) configure it. Pruning to `.c/.h/.S` would cut 251 MB to ~110 MB but was
+**rejected**: DWARF names compilation units, while headers come from the line table, so the servable
+set is open-ended and pruning by extension would reintroduce exactly the silent-wrong-answer class
+the patching fixes.
+
+`sync.sh` sends `srcindex/` and both Dockerfiles, and `run.sh --deb` builds and starts the pair.
+Note `sync.sh` lists top-level packages **explicitly**, not by glob: forgetting one is a remote-only
+failure, where the image builds locally and its `COPY` fails on the host.
+
+**`cmd/proxy` routes to it through a delegate, not an upstream.** `Server.SourceVia` names a server
+that serves `/source/*` for build IDs this one resolves but cannot supply sources for; `debian`
+points at `debian-src`, and `applySourceRules` (the single place where "resolved but no sources"
+becomes a 501, shared by the fast and slow paths) hands the request over instead.
+
+Delegates live in their own map and are **deliberately not in `servers`**: `tryAllServers` probes
+every entry there with `/buildid/<id>/debuginfo`, and a source-only backend answers 501 to that — so
+it would be probed on every cold build ID, fail every time, and appear in `resolve_logs` and on
+`/stats` as a backend with a 0% success rate. `TestDelegateWiringIsConsistent` pins both directions.
+
+Two consequences that were not obvious:
+
+- The delegate appears in `access_log.resolved_host` and never in `resolve_logs`, so the `/stats`
+  offline badge would have marked it offline on every page load. `isOffline` now requires probe
+  history: "stopped being probed" says nothing about something that was never in the rotation.
+- It must be on **loopback**, and not just as a deployment preference: `fetchClientFor` gives
+  loopback the client with no response-header timeout, and a source backend writes headers only
+  after unpacking a package — seconds, or minutes for a large one. A remote delegate would be cut
+  off at the 5 s limit on every cold package. The same test pins it.
+
 ### ClickHouse tables
 
 Created by `db.Init()` in each service.
@@ -551,18 +782,30 @@ Created by `db.Init()` in each service.
   run yet.
 - `resolve_logs` — one row per upstream probe per resolution (so ~10 rows per cold build ID).
 - `access_log` — per-request, `PARTITION BY toYYYYMM(timestamp)`, includes a
-  `Tuple(size, file, archive, imasignature)` of debuginfod response headers.
+  `Tuple(size, file, archive, imasignature)` of debuginfod response headers, plus `country`
+  (`CF-IPCountry`) and `tags` (`Array(LowCardinality(String))`, currently only `github_actions`).
+  Both arrived with an `ALTER … ADD COLUMN IF NOT EXISTS` beside the `CREATE`
+  (`TestDBAccessLogMigrationAddsTagsAndCountry`) — without it every deployed instance would keep
+  the old table and every `INSERT` would fail, which is worse than the `cache_stats` case since
+  this is the table every request writes.
 - `github_download_stats` — created and written by `cmd/releases`, not by the proxy
 - `releases_access_log` — one row per release redirect: `version`, `file` (both straight from the
   route match, not parsed back out of the URI), `request_uri`, `status`, `user_agent`, `country`
   from `CF-IPCountry`. Deliberately **not** a copy of `access_log`: everything that table records
   about proxying debuginfo is empty for a 302. `cmd/releases/MIGRATION.sql` moves the historical
-  rows out of `access_log` (`endpoint_name = 'releases'`) and deletes them there — run it by hand,
-  after starting the service once so `Init()` has created the table
+  rows out of `access_log` (`endpoint_name = 'releases'`) and deletes them there. **Already run** —
+  `access_log` now holds only `debuginfo`, `executable` and `source`, which is why the clients panel
+  filtering with `endpoint_name != 'releases'` had quietly become "every endpoint"; it lists
+  `statsEndpoints` positively now, pinned by `TestStatsPanelsAgreeOnEndpoints`
 - `cache_stats` — one row per measurement of `CACHE_PATH`: blob count, allocated bytes
   (`st_blocks`) alongside apparent bytes, bytes tied up in abandoned `.tmp-*`, plus partition
   size and free space from `statfs`
 - `nix_access_log` — created by `cmd/nix-debuginfod` only.
+- `pbs_buildids`, `pbs_assets` — created and written by `cmd/indexer` only; nothing reads them yet.
+  `pbs_buildids` is build ID → (release asset, member path); `pbs_assets` is the resume log, keyed
+  on the asset's compressed size, since a published release asset is immutable. Neither has ever
+  existed in production, so both are still initial schema and carry no `ALTER` — that stops being
+  true on the first run against the real instance.
 
 Access-log and stats inserts use `PrepareBatch` with `clickhouse.WithStdAsync(false)`; state updates
 use `AsyncInsert`. DB calls take a 5s timeout (60s for source indexing).

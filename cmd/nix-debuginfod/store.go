@@ -12,7 +12,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
 	"sync"
+
+	"github.com/pwndbg/debuginfod.pwndbg.re/srcindex"
 
 	"golang.org/x/sync/singleflight"
 )
@@ -73,7 +76,7 @@ type store struct {
 	mounted map[string]mountKind // mount point -> how it was mounted
 
 	idxMu sync.Mutex
-	idx   map[string]*sourceIndex // mounted tree -> its file index
+	idx   map[string]*srcindex.Index // mounted tree -> its file index
 }
 
 func newStore(fetcher narFetcher, imageDir, mountRoot, entryRoot string, maxFetches int) *store {
@@ -116,7 +119,7 @@ func newStore(fetcher narFetcher, imageDir, mountRoot, entryRoot string, maxFetc
 		mountRoot: mountRoot,
 		entryRoot: entryRoot,
 		mounted:   map[string]mountKind{},
-		idx:       map[string]*sourceIndex{},
+		idx:       map[string]*srcindex.Index{},
 		slots:     make(chan struct{}, maxFetches),
 	}
 }

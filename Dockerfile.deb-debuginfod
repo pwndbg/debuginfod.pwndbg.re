@@ -1,0 +1,14 @@
+# Minimal on purpose: everything that needs Debian tooling lives in
+# Dockerfile.deb-unpack, and this container only reads an already-unpacked tree
+# off the shared volume.
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ ./cmd
+COPY srcindex/ ./srcindex
+RUN CGO_ENABLED=0 go build -o /out/deb-debuginfod ./cmd/deb-debuginfod
+
+FROM gcr.io/distroless/static-debian13
+COPY --from=build /out/deb-debuginfod /deb-debuginfod
+ENTRYPOINT ["/deb-debuginfod"]

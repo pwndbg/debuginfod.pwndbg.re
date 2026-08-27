@@ -1,4 +1,4 @@
-package main
+package srcindex
 
 import (
 	"os"
@@ -31,7 +31,7 @@ func TestSourceIndexMatchesFromTheRight(t *testing.T) {
 		"glibc-2.42/elf/dl-find_object.c",
 		"getsysstats.c",
 	)
-	ix, err := newSourceIndex(root)
+	ix, err := New(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestSourceIndexMatchesFromTheRight(t *testing.T) {
 			if tc.want != "" {
 				want = filepath.Join(root, tc.want)
 			}
-			if got := ix.find(tc.req); got != want {
+			if got := ix.Find(tc.req); got != want {
 				t.Errorf("find(%q) = %q, want %q", tc.req, got, want)
 			}
 		})
@@ -68,12 +68,12 @@ func TestSourceIndexScoresBothTreesTogether(t *testing.T) {
 	overlay := tree(t, "misc/getsysstats.c")
 	source := tree(t, "glibc-2.42/sysdeps/unix/sysv/linux/getsysstats.c")
 
-	ix, err := newSourceIndex(overlay, source)
+	ix, err := New(overlay, source)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	got := ix.find("/build/../sysdeps/unix/sysv/linux/getsysstats.c")
+	got := ix.Find("/build/../sysdeps/unix/sysv/linux/getsysstats.c")
 	want := filepath.Join(source, "glibc-2.42/sysdeps/unix/sysv/linux/getsysstats.c")
 	if got != want {
 		t.Errorf("find = %q, want the longer match in .source (%q)", got, want)
@@ -87,11 +87,11 @@ func TestSourceIndexOverlayWinsATie(t *testing.T) {
 	overlay := tree(t, rel)
 	source := tree(t, rel)
 
-	ix, err := newSourceIndex(overlay, source)
+	ix, err := New(overlay, source)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := ix.find("/build/"+rel), filepath.Join(overlay, rel); got != want {
+	if got, want := ix.Find("/build/"+rel), filepath.Join(overlay, rel); got != want {
 		t.Errorf("find = %q, want the overlay copy (%q)", got, want)
 	}
 }
@@ -100,11 +100,11 @@ func TestSourceIndexOverlayWinsATie(t *testing.T) {
 // unreadable tree is skipped rather than failing the index.
 func TestSourceIndexToleratesAMissingTree(t *testing.T) {
 	source := tree(t, "pkg/main.c")
-	ix, err := newSourceIndex(filepath.Join(t.TempDir(), "no-such-overlay"), source)
+	ix, err := New(filepath.Join(t.TempDir(), "no-such-overlay"), source)
 	if err != nil {
 		t.Fatalf("a missing overlay must not fail the index: %v", err)
 	}
-	if got, want := ix.find("/build/pkg/main.c"), filepath.Join(source, "pkg/main.c"); got != want {
+	if got, want := ix.Find("/build/pkg/main.c"), filepath.Join(source, "pkg/main.c"); got != want {
 		t.Errorf("find = %q, want %q", got, want)
 	}
 }
@@ -113,7 +113,7 @@ func TestSourceIndexToleratesAMissingTree(t *testing.T) {
 // joined onto a root - so a request cannot name a file outside them whatever it
 // contains. That is structural, not a filter to be forgotten.
 func TestSourceIndexNeverEscapesTheTree(t *testing.T) {
-	ix, err := newSourceIndex(tree(t, "real.c"))
+	ix, err := New(tree(t, "real.c"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestSourceIndexNeverEscapesTheTree(t *testing.T) {
 		"/etc/passwd",
 		"/root/../../../../etc/shadow",
 	} {
-		if got := ix.find(bad); got != "" {
+		if got := ix.Find(bad); got != "" {
 			t.Errorf("find(%q) = %q, want no match", bad, got)
 		}
 	}
