@@ -580,3 +580,49 @@ func TestDelegateWiringIsConsistent(t *testing.T) {
 		}
 	}
 }
+
+// tryAllServers must return when every upstream fails. That is not an edge
+// case: roughly 94% of traffic resolves to nothing.
+//
+// It used to hang instead. close(ch) fired when the error count reached
+// len(f.servers), but servers marked Down are skipped and never get a goroutine
+// - so with one Down upstream the count topped out one short, the channel was
+// never closed, and the final select had no ctx.Done() branch to leave through.
+// The request itself escaped through FindByBuildID's own timeout, but this
+// goroutine leaked for good and kept the singleflight key held, so every later
+// request for the same build id queued behind a call that would never finish.
+//
+// The bug appeared the moment ubuntu was marked Down; before that the count and
+// the goroutines happened to agree.
+func TestTryAllServersReturnsWhenEveryUpstreamFails(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, nil)
+	}))
+	defer dead.Close()
+
+	f := &DebugInfoFinder{
+		db:     &fakeStore{},
+		client: dead.Client(),
+		servers: map[string]*Server{
+			"a":    {Name: "a", URL: dead.URL},
+			"b":    {Name: "b", URL: dead.URL},
+			"gone": {Name: "gone", URL: dead.URL, Down: true},
+		},
+	}
+	f.localFetchClient = f.client
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, err := f.tryAllServers(context.Background(), "deadbeef", "/buildid/deadbeef/debuginfo")
+		if !stderrors.Is(err, ErrDebuginfoNotFound) {
+			t.Errorf("err = %v, want ErrDebuginfoNotFound", err)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("tryAllServers never returned - the goroutine is leaked and the singleflight key is stuck")
+	}
+}

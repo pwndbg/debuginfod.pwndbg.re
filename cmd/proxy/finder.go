@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
@@ -384,18 +383,19 @@ func (f *DebugInfoFinder) tryAllServers(ctx context.Context, buildID string, req
 	defer cancelFind()
 
 	ch := make(chan resolveResult, 1)
-	var errCounter atomic.Int64
-	maxErrors := int64(len(f.servers))
 
 	var entries []ResolveLogEntry
 	entriesMu := sync.Mutex{}
 
+	var wg sync.WaitGroup
 	for _, server := range f.servers {
 		if server.Down {
 			continue
 		}
 
+		wg.Add(1)
 		go func(server *Server) {
+			defer wg.Done()
 			startAt := time.Now()
 			headers, err := f.Probe(ctxForFind, server.URL+requestURI)
 
@@ -416,9 +416,6 @@ func (f *DebugInfoFinder) tryAllServers(ctx context.Context, buildID string, req
 
 			if err != nil {
 				logger.WithError(err).WithField("host", server.Name).Info("fetching server err")
-				if errCounter.Add(1) == maxErrors {
-					close(ch)
-				}
 				return
 			}
 			logger.WithField("host", server.Name).Info("fetching server ok")
@@ -431,20 +428,26 @@ func (f *DebugInfoFinder) tryAllServers(ctx context.Context, buildID string, req
 		}(server)
 	}
 
-	select {
-	case res, ok := <-ch:
-		// The losing goroutines may still be appending to entries, so we read a copy
-		// under the mutex - otherwise this is a race on the slice header.
+	// Closing after every probe has finished is safe from the other direction
+	// too: no goroutine is alive to send once wg.Wait returns, so this cannot
+	// close a channel somebody is still writing to.
+	go func() {
+		wg.Wait()
+		close(ch)
 
-		// TODO: move this to the background
-		entriesMu.Lock()
-		resolveEntries := make([]ResolveLogEntry, len(entries))
-		copy(resolveEntries, entries)
-		entriesMu.Unlock()
-
-		if err := f.db.ResolveLog(context.Background(), resolveEntries); err != nil {
+		if err := f.db.ResolveLog(context.Background(), entries); err != nil {
 			logger.WithError(err).Error("ResolveLog err")
 		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		// A cancelled request is not a missing build id. Returning
+		// ErrDebuginfoNotFound here would record a failure against it and start
+		// the negative backoff, so a client that hung up would make the build id
+		// harder to resolve for everyone else.
+		return nil, StateHeaders{}, ctx.Err()
+	case res, ok := <-ch:
 		if !ok {
 			return nil, StateHeaders{}, ErrDebuginfoNotFound
 		}
