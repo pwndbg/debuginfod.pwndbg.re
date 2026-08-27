@@ -18,20 +18,47 @@ This proxy solves that: point your debugger at **one** URL and every build-id lo
 
 ## Upstream servers
 
-| Name       | URL                                     |
-| ---------- | --------------------------------------- |
-| systemtap  | https://debuginfod.systemtap.org        |
-| opensuse   | https://debuginfod.opensuse.org         |
-| voidlinux  | https://debuginfod.s.voidlinux.org      |
-| debian     | https://debuginfod.debian.net           |
-| fedora     | https://debuginfod.fedoraproject.org    |
-| altlinux   | https://debuginfod.altlinux.org         |
-| archlinux  | https://debuginfod.archlinux.org        |
-| artixlinux | https://debuginfod.artixlinux.org       |
-| centos     | https://debuginfod.centos.org           |
-| ubuntu     | https://debuginfod.ubuntu.com           |
-| alpine     | https://debuginfod.achill.org           |
-| nix        | our custom debuginfod server for nix/nixpkgs    |
+| Name       | URL                                         | debuginfo | executable | source | Old build ids |
+| ---------- | ------------------------------------------- | :-------: | :--------: | :----: | ------------- |
+| systemtap  | https://debuginfod.systemtap.org            |     ✅     |     ❌      |   ✅    | kept          |
+| opensuse   | https://debuginfod.opensuse.org             |     ✅     |     ✅      |   ✅    | expire       |
+| fedora     | https://debuginfod.fedoraproject.org        |     ✅     |     ✅      |   ✅    | kept          |
+| archlinux  | https://debuginfod.archlinux.org            |     ✅     |     ❌      |   ✅    | expire        |
+| artixlinux | https://debuginfod.artixlinux.org           |     ✅     |     ❌      |   ✅    | expire       |
+| cachyos    | https://debuginfod.cachyos.org              |     ✅     |     ❌      |   ✅    | expire       |
+| centos     | https://debuginfod.centos.org               |     ✅     |     ✅      |   ✅    | kept          |
+| debian     | https://debuginfod.debian.net               |     ✅     |     ❌      | ✅ ours |    expire     |
+| nix        | our own debuginfod server for nix / nixpkgs |     ✅     |     ✅      |   ✅    | kept          |
+
+❔ means we have not served enough of that endpoint from that upstream to say. Debian serves no
+sources at all — that column is green because we serve them ourselves, see below.
+
+**Old build ids** is measured from our own logs: build ids we served once and later could not.
+*expire* means old builds do disappear upstream — around a month for archlinux, a few months for
+debian — so a binary from an older release may have no symbols anywhere.
+
+### Not currently queried
+
+Listed so it is clear these are known and deliberate, rather than forgotten. None of them is
+contacted, so a build id only they would have comes back as not found.
+
+| Name      | URL                                | Why                                          |
+| --------- | ---------------------------------- | -------------------------------------------- |
+| ubuntu    | https://debuginfod.ubuntu.com      | disabled — requests hung for ~45 s and never completed |
+| alpine    | https://debuginfod.achill.org      | disabled — server offline                    |
+| elfutils  | https://debuginfod.elfutils.org    | disabled — server misbehaves                 |
+| voidlinux | https://debuginfod.s.voidlinux.org | never configured                             |
+| altlinux  | https://debuginfod.altlinux.org    | never configured                             |
+
+## Debian sources
+
+`debuginfod.debian.net` serves debug info and executables, but returns 404 for **every** source
+path — so on Debian you get disassembly and symbol names, and no source lines.
+
+We fill that gap ourselves: a Debian build id is resolved to the source package it came from, which
+is fetched and unpacked **with the Debian patch series applied**, because the pristine upstream
+sources do not line up with the debugger's line numbers. This is new — if a source path should
+resolve and does not, please [open an issue](https://github.com/pwndbg/debuginfod.pwndbg.re/issues).
 
 ## Usage
 
@@ -73,6 +100,8 @@ GET /buildid/<BUILDID>/debuginfo
 GET /buildid/<BUILDID>/executable
 GET /buildid/<BUILDID>/source/<SOURCE-PATH>
 ```
+
+Beyond the protocol, **[/stats](https://debuginfod.pwndbg.re/stats)** is a public page of traffic charts.
 
 ## Related projects
 

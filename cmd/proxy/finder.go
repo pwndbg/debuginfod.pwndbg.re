@@ -190,7 +190,7 @@ func NewDebugInfoFinder(db stateStore) *DebugInfoFinder {
 			"fedora":     {Name: "fedora", Down: false, SourceAvailable: 1, URL: "https://debuginfod.fedoraproject.org"},
 			"archlinux":  {Name: "archlinux", Down: false, SourceAvailable: 1, URL: "https://debuginfod.archlinux.org"},
 			"artixlinux": {Name: "artixlinux", Down: false, SourceAvailable: 1, URL: "https://debuginfod.artixlinux.org"},
-			"cachyos":    {Name: "cachyos", Down: false, SourceAvailable: 1, URL: "https://debuginfod.cachyos.org"}, // untested source
+			"cachyos":    {Name: "cachyos", Down: false, SourceAvailable: 1, URL: "https://debuginfod.cachyos.org"},
 			"centos":     {Name: "centos", Down: false, SourceAvailable: 1, URL: "https://debuginfod.centos.org"},
 			"debian":     {Name: "debian", Down: false, SourceAvailable: 0, URL: "https://debuginfod.debian.net", SourceVia: "debian-src"},
 			"ubuntu":     {Name: "ubuntu", Down: true, SourceAvailable: 0, URL: "https://debuginfod.ubuntu.com"},
