@@ -104,7 +104,7 @@ func (s *serverSrv) proxyRequest(w http.ResponseWriter, r *http.Request, ps http
 	entry.ResolvedHost = host.Name
 
 	fetch := func(ctx context.Context) (*http.Response, error) {
-		return s.finder.Fetch(ctx, host.URL+r.URL.EscapedPath())
+		return s.finder.FetchFor(ctx, host, buildId, host.URL+r.URL.EscapedPath())
 	}
 
 	if s.cache != nil && cacheableEndpoints[entry.EndpointName] {

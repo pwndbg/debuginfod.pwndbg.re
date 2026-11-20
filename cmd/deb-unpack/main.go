@@ -20,10 +20,12 @@
 // a package name and shells out, so it is an internal component, not an API.
 //
 // Ubuntu runs as a second instance of the same binary with its own volume and
-// MIRROR pointed at archive.ubuntu.com, whose pool has the same layout. No
-// fallback to Launchpad for versions the pool has dropped: ddebs.ubuntu.com
-// drops the same versions at the same time, so debuginfod.ubuntu.com does not
-// resolve those build IDs either and they never reach this service.
+// MIRROR pointed at archive.ubuntu.com, whose pool has the same layout.
+//
+// Both pools drop superseded versions, so a package can be gone from MIRROR
+// while we still serve its debuginfo - the proxy passes on the archive it
+// recorded, so such build IDs do reach this service. FALLBACK names a permanent
+// archive for exactly that case: snapshot.debian.org or Launchpad (fallback.go).
 package main
 
 import (
@@ -86,8 +88,11 @@ type unpackResponse struct {
 type server struct {
 	root   string
 	mirror string
-	hc     *http.Client
-	group  singleflight.Group
+	// fallback is asked for a package the mirror's pool no longer has; nil
+	// when none is configured. See fallback.go.
+	fallback sourceArchive
+	hc       *http.Client
+	group    singleflight.Group
 }
 
 func main() {
@@ -96,6 +101,10 @@ func main() {
 		root   = envOr("UNPACK_PATH", "/var/lib/deb-src")
 		mirror = envOr("MIRROR", "https://deb.debian.org/debian")
 	)
+	fallback, err := fallbackFromEnv(os.Getenv("FALLBACK"), os.Getenv("FALLBACK_URL"))
+	if err != nil {
+		log.WithError(err).Fatal("FALLBACK")
+	}
 	if _, err := exec.LookPath("dpkg-source"); err != nil {
 		// Fatal rather than degraded: without dpkg-source this service can do
 		// nothing at all, and finding that out per request would turn a
@@ -106,7 +115,7 @@ func main() {
 		log.WithError(err).Fatal("creating unpack root")
 	}
 
-	s := &server{root: root, mirror: mirror,
+	s := &server{root: root, mirror: mirror, fallback: fallback,
 		hc: useragent.Client(&http.Client{Timeout: 10 * time.Minute}, "deb-unpack")}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /unpack", s.handleUnpack)
@@ -132,7 +141,8 @@ func main() {
 		}
 	}()
 
-	log.WithField("addr", addr).WithField("root", root).WithField("mirror", mirror).Info("deb-unpack starting")
+	log.WithField("addr", addr).WithField("root", root).WithField("mirror", mirror).
+		WithField("fallback", fallbackName(fallback)).Info("deb-unpack starting")
 	if err := srv.ListenAndServe(); err != nil {
 		log.WithError(err).Fatal("server failed")
 	}
@@ -168,7 +178,7 @@ func (s *server) handleUnpack(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		log.WithError(err).WithField("package", key).Warn("unpack failed")
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, err.Error(), unpackStatus(err))
 		return
 	}
 
@@ -202,19 +212,9 @@ func (s *server) unpack(ctx context.Context, req unpackRequest) (unpackResponse,
 	}
 	defer os.RemoveAll(work)
 
-	base := fmt.Sprintf("%s/pool/%s/%s/%s", s.mirror, req.Component, poolDir(req.Source), req.Source)
-	dsc := req.Source + "_" + req.Version + ".dsc"
-	if err := s.download(ctx, base+"/"+dsc, filepath.Join(work, dsc)); err != nil {
-		return unpackResponse{}, fmt.Errorf("fetching %s: %w", dsc, err)
-	}
-	files, err := filesFromDsc(filepath.Join(work, dsc))
+	dsc, err := s.fetchSources(ctx, req, work)
 	if err != nil {
-		return unpackResponse{}, err
-	}
-	for _, f := range files {
-		if err := s.download(ctx, base+"/"+f, filepath.Join(work, f)); err != nil {
-			return unpackResponse{}, fmt.Errorf("fetching %s: %w", f, err)
-		}
+		return unpackResponse{}, fmt.Errorf("%w: %w", errFetch, err)
 	}
 
 	out := filepath.Join(work, "tree")
@@ -243,6 +243,28 @@ func (s *server) unpack(ctx context.Context, req unpackRequest) (unpackResponse,
 	return unpackResponse{Path: final, Files: n, Bytes: size}, nil
 }
 
+// errFetch marks a failure to get the package's files from the pool or the
+// fallback - something behind this service - as opposed to a failure here.
+var errFetch = errors.New("fetching sources")
+
+// unpackStatus says whose failure it was.
+//
+//   - 404: the package is in neither the pool nor the fallback. An answer, not a
+//     failure, and cmd/deb-debuginfod remembers it for longer than one.
+//   - 502: the pool or the fallback failed - a 5xx, a timeout, a file whose sha1
+//     does not match. Theirs, and likely to pass.
+//   - 500: ours - dpkg-source, the disk, a rename. Retrying will not fix it, and
+//     a 502 would send whoever reads the logs to look at Debian instead of here.
+func unpackStatus(err error) int {
+	switch {
+	case errors.Is(err, errNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, errFetch):
+		return http.StatusBadGateway
+	}
+	return http.StatusInternalServerError
+}
+
 func (s *server) download(ctx context.Context, url, dst string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -253,6 +275,9 @@ func (s *server) download(ctx context.Context, url, dst string) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return errNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		return errors.New(resp.Status)
 	}

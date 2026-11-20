@@ -345,10 +345,67 @@ func (f *DebugInfoFinder) Probe(ctx context.Context, url string) (StateHeaders, 
 	}, nil
 }
 
+// delegateArchiveHeader carries, from the proxy to a source delegate, the
+// archive the resolving upstream named for a build ID when we resolved it.
+//
+// The delegate needs exactly one fact - which package a build ID came from -
+// and its only way to learn it on its own is to ask the upstream again. That
+// fails once the upstream has dropped the build ID, which Debian and Ubuntu both
+// do when a version is superseded, while we still hold it: buildid_state keeps
+// the success, and the file cache keeps serving the debuginfo. Measured on
+// 9bee4eb8...c1a1f7cf (glibc 2.43-4): debuginfo a 200 HIT from our cache,
+// debuginfod.debian.net a 404, the .dsc still in Debian's pool - and every
+// source request a 404, because the one lookup that could not succeed was the
+// only one made.
+const delegateArchiveHeader = "x-debuginfod-archive"
+
+// FetchFor fetches url from host on behalf of a request for buildID.
+//
+// For an ordinary upstream it is Fetch. For a source delegate it also passes on
+// the archive recorded in buildid_state, so the delegate does not depend on the
+// upstream still knowing the build ID. The value is OUR record, never anything
+// the client sent - newUpstreamRequest still forwards no client header - and
+// only a delegate gets it: they are on loopback and ours, and a third party has
+// no use for it.
+func (f *DebugInfoFinder) FetchFor(ctx context.Context, host *Server, buildID, url string) (*http.Response, error) {
+	var archive string
+	if _, ok := f.delegates[host.Name]; ok {
+		archive = f.recordedArchive(ctx, buildID, host.Name)
+	}
+	return f.fetch(ctx, url, archive)
+}
+
+// recordedArchive returns the archive stored for buildID, provided it was
+// recorded by an upstream that delegates its sources to delegate. Empty when
+// there is none - rows written before response_headers existed, say - in which
+// case the delegate falls back to asking the upstream, as it always did.
+//
+// The state is normally an LRU hit: FindByBuildID read or wrote it a moment ago.
+func (f *DebugInfoFinder) recordedArchive(ctx context.Context, buildID, delegate string) string {
+	state, err := f.GetState(ctx, buildID)
+	if err != nil || !state.LastSuccess {
+		return ""
+	}
+	// An archive path from one distribution handed to another's delegate would
+	// name a package that does not exist there. It cannot happen while each
+	// delegate serves one upstream, but it costs one map lookup to make sure.
+	if up, ok := f.servers[state.LastHost]; !ok || up.SourceVia != delegate {
+		return ""
+	}
+	return state.ResponseHeaders.Archive
+}
+
 func (f *DebugInfoFinder) Fetch(ctx context.Context, url string) (*http.Response, error) {
+	return f.fetch(ctx, url, "")
+}
+
+func (f *DebugInfoFinder) fetch(ctx context.Context, url, archive string) (*http.Response, error) {
 	req, err := f.newUpstreamRequest(ctx, url)
 	if err != nil {
 		return nil, err
+	}
+	if archive != "" {
+		req.Header.Set(delegateArchiveHeader, archive)
 	}
 
 	resp, err := f.fetchClientFor(url).Do(req)

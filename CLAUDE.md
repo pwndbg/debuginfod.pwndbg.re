@@ -751,6 +751,17 @@ instead was rejected: it needs the docker socket, which is root on the host.
   source request costs a round trip to Debian: measured **140 ms → 0.3 ms** warm. Failures are
   deliberately **not** cached — a failure is usually "Debian was slow", and a 24 h TTL would turn a
   blip into a day-long outage for that build ID.
+- **A package that could not be prepared is remembered, briefly** (`missing`/`failed` in
+  `deb-debuginfod`), so a debugger walking fifty files of it makes one attempt instead of fifty
+  rounds of pool + `snapshot.debian.org`/Launchpad. Two TTLs because the outcomes differ: in neither
+  the pool nor the fallback — the unpacker answers **404** for exactly that — is an answer, held
+  1 h and served as 404; any other failure is held 1 min, long enough to collapse a burst, short
+  enough that a blip stays a blip. Those are **502 when the failure was behind us** (pool, fallback,
+  an unreachable unpacker) and **500 when it was ours** (`dpkg-source`, the disk, indexing) —
+  `unpackStatus` and `prepareStatus` — so the logs point at Debian or at this host. The proxy turns
+  both into a 500 for the client either way. A **cancelled** request is never cached:
+  singleflight shares the leader's fate with every waiter, so caching it would hand one client's
+  disconnect to everyone. All three pinned in `failure_test.go`.
 - `--no-check` skips the `.dsc` signature check. Deliberate: verifying needs the Debian keyring in
   that image, and the bytes came over TLS from the archive that signed them. Revisit before pointing
   this at an untrusted mirror.
@@ -808,10 +819,22 @@ the patching fixes.
 - **A second pair, not a second distro inside one.** The server evicts whatever the unpacker's
   `/trees` lists, so two servers on one volume would each evict the other's trees by mtime, never
   having seen their traffic — the same "one owner per volume" rule as above.
-- **No Launchpad fallback, deliberately.** The pool drops superseded stable updates
-  (`coreutils 8.32-4.1ubuntu1.2` is gone, Launchpad still has it), which looks like a gap — but
-  `ddebs.ubuntu.com` drops exactly the same versions, so `debuginfod.ubuntu.com` 404s those build IDs
-  too and they never reach the delegate. A fallback was written and removed; it could not fire.
+- **Both pools drop superseded versions, so the unpacker has a fallback** (`FALLBACK`, `fallback.go`).
+  `deb.debian.org` no longer has glibc 2.41-1…10; `archive.ubuntu.com` no longer has
+  `coreutils 8.32-4.1ubuntu1.2`. Such build IDs reach the unpacker because the proxy passes on the
+  recorded archive (below), and the pool's 404 would otherwise be the answer.
+  - Debian: `snapshot` — `snapshot.debian.org`, every version ever published. Addressed by content:
+    `/mr/package/<src>/<ver>/srcfiles?fileinfo=1` lists name → sha1, each file is `/file/<sha1>`,
+    and each download is **checked against that sha1** — the only integrity check on this path,
+    since `dpkg-source` runs with `--no-check`.
+  - Ubuntu: `launchpad` — `+sourcefiles/<src>/<ver>/<file>`, verified back to 14.04.
+    `snapshot.ubuntu.com` is not used: it is addressed by date and starts in 2023.
+  - Asked **only on a 404** from the pool, never on a 5xx — a mirror outage must not be hidden by
+    moving load onto an archive that is not a mirror. Once asked, **every file of the package comes
+    from the fallback**, even ones the pool still has (the orig tarball usually outlives the Debian
+    revision), so a tree is never assembled from two sources. An unknown `FALLBACK` value is fatal at
+    startup rather than silently meaning "none".
+  - Verified end to end: `hello 2.10-4` via snapshot, `coreutils 8.32-4.1ubuntu1.2` via Launchpad.
 
 `sync.sh` sends `srcindex/` and both Dockerfiles, and `run.sh --deb` builds and starts both pairs.
 Note `sync.sh` lists top-level packages **explicitly**, not by glob: forgetting one is a remote-only
@@ -826,6 +849,16 @@ Delegates live in their own map and are **deliberately not in `servers`**: `tryA
 every entry there with `/buildid/<id>/debuginfo`, and a source-only backend answers 501 to that — so
 it would be probed on every cold build ID, fail every time, and appear in `resolve_logs` and on
 `/stats` as a backend with a 0% success rate. `TestDelegateWiringIsConsistent` pins both directions.
+
+**The proxy tells the delegate which package a build ID is** (`FetchFor`, header
+`x-debuginfod-archive`), from `buildid_state.response_headers.archive` — what the upstream said when
+it resolved the build ID. Without it the delegate's only way to learn the package is to ask the
+upstream again, and upstreams drop build IDs when a version is superseded while we keep serving
+them: `9bee4eb8…c1a1f7cf` (glibc 2.43-4) was a 200 HIT for debuginfo, a 404 at
+`debuginfod.debian.net`, its `.dsc` still in the pool — and every source request a 404. Only
+delegates get the header, never a third-party upstream, and only from a state whose `last_host`
+delegates to that same delegate. An empty record (rows older than the column) or one that does not
+parse falls back to asking the upstream, as before.
 
 Two consequences that were not obvious:
 

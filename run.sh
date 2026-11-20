@@ -105,6 +105,7 @@ deb() {
     --network host \
     -e LISTEN_ADDR=127.0.0.1:8035 \
     -e UNPACK_PATH=/var/lib/deb-src \
+    -e FALLBACK=snapshot \
     -v "deb_src:/var/lib/deb-src" \
     "pwndbg-deb-unpack"
 
@@ -122,6 +123,10 @@ deb() {
     -v "deb_src:/var/lib/deb-src:ro" \
     "pwndbg-deb-debuginfod"
 
+  # FALLBACK: both pools drop superseded versions while we keep serving their
+  # debuginfo. snapshot.debian.org and Launchpad keep every version, and are
+  # asked only on a 404 from the pool.
+  #
   # Ubuntu: the same two images, a second pair of containers. Its own volume and
   # its own eviction budget rather than sharing Debian's, because the server
   # evicts whatever the unpacker lists - two servers on one volume would each
@@ -134,6 +139,7 @@ deb() {
     -e LISTEN_ADDR=127.0.0.1:8037 \
     -e UNPACK_PATH=/var/lib/deb-src \
     -e MIRROR=https://archive.ubuntu.com/ubuntu \
+    -e FALLBACK=launchpad \
     -v "ubuntu_src:/var/lib/deb-src" \
     "pwndbg-deb-unpack"
 

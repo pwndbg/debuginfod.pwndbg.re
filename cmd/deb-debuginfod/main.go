@@ -72,6 +72,20 @@ const (
 	// from an outage or a mirror move from being permanent.
 	resolveCacheSize = 10_000
 	resolveCacheTTL  = 24 * time.Hour
+
+	// missingTTL and failedTTL bound how long a package that could not be
+	// prepared is remembered as such, so a debugger stepping through fifty
+	// files of it makes one attempt rather than fifty - each of which is a
+	// request to the pool and then to snapshot.debian.org or Launchpad.
+	//
+	// Two numbers because the two outcomes mean different things. "In neither
+	// the pool nor the fallback" is an answer: a version dropped from both does
+	// not come back, and the hour only forgives a mirror caught mid-sync. Any
+	// other failure - a 5xx, a timeout, dpkg-source - is usually transient, and
+	// remembering it for long would turn a blip into an outage, so it is held
+	// just long enough to collapse a burst.
+	missingTTL = time.Hour
+	failedTTL  = time.Minute
 )
 
 type srv struct {
@@ -90,6 +104,11 @@ type srv struct {
 	group    singleflight.Group
 
 	resolved *expirable.LRU[string, pkgRef]
+
+	// missing and failed remember packages that could not be prepared, keyed
+	// like indexes; see missingTTL. Either may be nil in tests.
+	missing *expirable.LRU[string, error]
+	failed  *expirable.LRU[string, error]
 	// resolveGroup coalesces concurrent lookups of the same cold build ID. A
 	// debugger opens several files at once, and without this each one would
 	// make its own request to Debian for the identical answer.
@@ -104,6 +123,8 @@ func main() {
 		indexes:  map[string]*srcindex.Index{},
 		lastUsed: map[string]time.Time{},
 		resolved: expirable.NewLRU[string, pkgRef](resolveCacheSize, nil, resolveCacheTTL),
+		missing:  expirable.NewLRU[string, error](resolveCacheSize, nil, missingTTL),
+		failed:   expirable.NewLRU[string, error](resolveCacheSize, nil, failedTTL),
 		// No overall timeout: unpacking a source package is minutes on a cold
 		// package. Per-request contexts bound the parts that should be quick.
 		hc: useragent.Client(&http.Client{}, "deb"),
@@ -174,7 +195,7 @@ func (s *srv) handleSource(w http.ResponseWriter, r *http.Request, ps httprouter
 	started := time.Now()
 	logger := log.WithField("buildid", buildID).WithField("path", reqPath)
 
-	pkg, err := s.resolve(r.Context(), buildID)
+	pkg, err := s.resolve(r.Context(), buildID, r.Header.Get(archiveHeader))
 	if err != nil {
 		logger.WithError(err).Debug("build ID does not resolve to a package upstream")
 		http.Error(w, "unknown build ID", http.StatusNotFound)
@@ -186,9 +207,15 @@ func (s *srv) handleSource(w http.ResponseWriter, r *http.Request, ps httprouter
 	s.touch(r.Context(), key)
 
 	ix, err := s.indexFor(r.Context(), pkg)
+	if errors.Is(err, errSourcesMissing) {
+		// An answer, not a failure: 404, which the edge also caches.
+		logger.WithError(err).Info("source package is in neither the pool nor the fallback")
+		http.Error(w, "source package not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
 		logger.WithError(err).Warn("preparing sources failed")
-		http.Error(w, "sources unavailable", http.StatusBadGateway)
+		http.Error(w, "sources unavailable", prepareStatus(err))
 		return
 	}
 
@@ -203,14 +230,15 @@ func (s *srv) handleSource(w http.ResponseWriter, r *http.Request, ps httprouter
 
 	f, err := os.Open(file)
 	if err != nil {
+		// Ours: the tree is on our volume, nothing upstream is involved.
 		logger.WithError(err).Warn("opening a file the index just offered")
-		http.Error(w, "sources unavailable", http.StatusBadGateway)
+		http.Error(w, "sources unavailable", http.StatusInternalServerError)
 		return
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		http.Error(w, "sources unavailable", http.StatusBadGateway)
+		http.Error(w, "sources unavailable", http.StatusInternalServerError)
 		return
 	}
 
@@ -225,15 +253,38 @@ func (s *srv) handleSource(w http.ResponseWriter, r *http.Request, ps httprouter
 		Info("served source")
 }
 
-// resolve asks the upstream debuginfod which package a build ID belongs to.
+// archiveHeader is how cmd/proxy passes on the archive it recorded for a build
+// ID when it resolved it (see delegateArchiveHeader there).
+const archiveHeader = "x-debuginfod-archive"
+
+// resolve finds the package a build ID belongs to.
+//
+// The proxy's record comes first when it sent one. The upstream drops build IDs
+// as versions are superseded, and once it has, asking it is a 404 even though
+// the sources may still be in the pool - glibc 2.43-4 was exactly that. The
+// record is never worse: it is what the same upstream said when it still knew
+// the build ID. A record that does not parse is logged and ignored, falling back
+// to the upstream as before; trusting it more than that would make a bug in the
+// proxy look like a missing package.
+//
+// Asking the upstream:
 //
 // It reads the headers and closes the body immediately: the debuginfo payload
 // is megabytes and none of it is wanted. HEAD is not used because debuginfod
 // servers are not required to implement it, and a GET whose body is dropped is
 // the portable way to ask the same question.
-func (s *srv) resolve(ctx context.Context, buildID string) (pkgRef, error) {
+func (s *srv) resolve(ctx context.Context, buildID, recorded string) (pkgRef, error) {
 	if pkg, ok := s.resolved.Get(buildID); ok {
 		return pkg, nil
+	}
+	if recorded != "" {
+		pkg, err := parseArchive(recorded)
+		if err == nil {
+			s.resolved.Add(buildID, pkg)
+			return pkg, nil
+		}
+		log.WithError(err).WithField("buildid", buildID).
+			Warn("the proxy's recorded archive does not parse; asking upstream instead")
 	}
 	res, err, _ := s.resolveGroup.Do(buildID, func() (any, error) {
 		pkg, err := s.askUpstream(ctx, buildID)
@@ -294,10 +345,14 @@ func (s *srv) indexFor(ctx context.Context, pkg pkgRef) (*srcindex.Index, error)
 		return ix, nil
 	}
 	s.mu.Unlock()
+	if err, ok := s.rememberedFailure(key); ok {
+		return nil, err
+	}
 
 	res, err, _ := s.group.Do(key, func() (any, error) {
 		root, err := s.unpack(ctx, pkg)
 		if err != nil {
+			s.rememberFailure(ctx, key, err)
 			return nil, err
 		}
 		ix, err := srcindex.New(root)
@@ -319,6 +374,58 @@ func (s *srv) indexFor(ctx context.Context, pkg pkgRef) (*srcindex.Index, error)
 	return res.(*srcindex.Index), nil
 }
 
+// errSourcesMissing means the unpacker found the package in neither the pool
+// nor its fallback.
+var errSourcesMissing = errors.New("source package not in the archive or its fallback")
+
+// errUpstream marks a failure behind this service: the unpacker unreachable,
+// or the unpacker reporting that the pool or its fallback failed (its 502).
+var errUpstream = errors.New("upstream failed")
+
+// prepareStatus maps a failure to prepare a package to a status. 502 when it
+// happened behind us; 500 when it was ours - the unpacker's own 500
+// (dpkg-source, its disk), or indexing the tree it produced. Telling the two
+// apart is what points whoever reads the logs at Debian or at this host.
+func prepareStatus(err error) int {
+	if errors.Is(err, errUpstream) {
+		return http.StatusBadGateway
+	}
+	return http.StatusInternalServerError
+}
+
+func (s *srv) rememberedFailure(key string) (error, bool) {
+	if s.missing != nil {
+		if err, ok := s.missing.Get(key); ok {
+			return err, true
+		}
+	}
+	if s.failed != nil {
+		if err, ok := s.failed.Get(key); ok {
+			return err, true
+		}
+	}
+	return nil, false
+}
+
+// rememberFailure records why a package could not be prepared - unless the
+// request was cancelled. A client hanging up says nothing about the package,
+// and since singleflight makes every waiter share the leader's fate, caching
+// that would hand one client's disconnect to everyone for a minute.
+func (s *srv) rememberFailure(ctx context.Context, key string, err error) {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		return
+	}
+	if errors.Is(err, errSourcesMissing) {
+		if s.missing != nil {
+			s.missing.Add(key, err)
+		}
+		return
+	}
+	if s.failed != nil {
+		s.failed.Add(key, err)
+	}
+}
+
 func (s *srv) unpack(ctx context.Context, pkg pkgRef) (string, error) {
 	body, err := json.Marshal(map[string]string{
 		"source": pkg.Source, "version": pkg.Version, "component": pkg.Component,
@@ -334,11 +441,17 @@ func (s *srv) unpack(ctx context.Context, pkg pkgRef) (string, error) {
 
 	resp, err := s.hc.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: unpacker unreachable: %w", errUpstream, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		switch resp.StatusCode {
+		case http.StatusNotFound:
+			return "", fmt.Errorf("%w: %s", errSourcesMissing, bytes.TrimSpace(msg))
+		case http.StatusBadGateway:
+			return "", fmt.Errorf("%w: unpacker: %s: %s", errUpstream, resp.Status, bytes.TrimSpace(msg))
+		}
 		return "", fmt.Errorf("unpacker: %s: %s", resp.Status, bytes.TrimSpace(msg))
 	}
 

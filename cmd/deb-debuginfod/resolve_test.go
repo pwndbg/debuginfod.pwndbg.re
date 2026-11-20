@@ -38,7 +38,7 @@ func TestResolveIsCached(t *testing.T) {
 		w.Header().Set("x-debuginfod-archive", glibcArchive)
 	})
 	for range 5 {
-		pkg, err := s.resolve(context.Background(), "c495b62edadd6c356265942ec1282d98058a7b41")
+		pkg, err := s.resolve(context.Background(), "c495b62edadd6c356265942ec1282d98058a7b41", "")
 		if err != nil {
 			t.Fatalf("resolve: %v", err)
 		}
@@ -59,7 +59,7 @@ func TestResolveDoesNotCacheFailures(t *testing.T) {
 		http.Error(w, "nope", http.StatusNotFound)
 	})
 	for range 3 {
-		if _, err := s.resolve(context.Background(), "deadbeef"); err == nil {
+		if _, err := s.resolve(context.Background(), "deadbeef", ""); err == nil {
 			t.Fatal("expected an error")
 		}
 	}
@@ -72,7 +72,7 @@ func TestResolveDoesNotCacheFailures(t *testing.T) {
 // as one either.
 func TestResolveRejectsMissingHeader(t *testing.T) {
 	s, _ := testSrv(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	if _, err := s.resolve(context.Background(), "abc"); err == nil {
+	if _, err := s.resolve(context.Background(), "abc", ""); err == nil {
 		t.Fatal("expected an error when the archive header is absent")
 	}
 }
@@ -89,7 +89,7 @@ func TestResolveCoalescesConcurrentLookups(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := s.resolve(context.Background(), "same-build-id"); err != nil {
+			if _, err := s.resolve(context.Background(), "same-build-id", ""); err != nil {
 				t.Error(err)
 			}
 		}()
@@ -118,10 +118,48 @@ func TestOutboundRequestsIdentifyTheProject(t *testing.T) {
 		hc:       useragent.Client(backend.Client(), "deb"),
 		resolved: expirable.NewLRU[string, pkgRef](resolveCacheSize, nil, resolveCacheTTL),
 	}
-	if _, err := s.resolve(context.Background(), "abc"); err != nil {
+	if _, err := s.resolve(context.Background(), "abc", ""); err != nil {
 		t.Fatal(err)
 	}
 	if want := useragent.String("deb"); got != want {
 		t.Errorf("User-Agent = %q, want %q", got, want)
+	}
+}
+
+// The production case: debuginfod.debian.net had dropped 9bee4eb8...c1a1f7cf
+// while glibc 2.43-4 was still in the pool, so asking it again 404'd every
+// source request. With the proxy's record the upstream is not asked at all.
+func TestRecordedArchiveIsUsedWithoutAskingUpstream(t *testing.T) {
+	s, calls := testSrv(t, func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, nil) // what an upstream that forgot the build ID says
+	})
+	pkg, err := s.resolve(context.Background(), "9bee4eb8329d9d71d9f59a08465751cbc1a1f7cf",
+		"/srv/mirror/debian-debug/dbg-main/g/glibc/libc6-dbg_2.43-4_amd64.deb")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if pkg.Source != "glibc" || pkg.Version != "2.43-4" || pkg.Component != "main" {
+		t.Errorf("got %+v", pkg)
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("asked upstream %d times despite a recorded archive", n)
+	}
+}
+
+// A record that does not parse must not become a 404 on its own: it may be a
+// proxy bug, while the upstream may still know the answer.
+func TestUnparseableRecordFallsBackToUpstream(t *testing.T) {
+	s, calls := testSrv(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("x-debuginfod-archive", glibcArchive)
+	})
+	pkg, err := s.resolve(context.Background(), "abc", "garbage")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if pkg.Source != "glibc" {
+		t.Errorf("got %+v, want the upstream's answer", pkg)
+	}
+	if n := atomic.LoadInt64(calls); n != 1 {
+		t.Errorf("asked upstream %d times, want 1", n)
 	}
 }
