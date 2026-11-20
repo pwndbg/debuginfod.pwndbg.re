@@ -19,6 +19,16 @@ func TestParseArchive(t *testing.T) {
 			source: "glibc", version: "2.41-12+deb13u3", comp: "main",
 		},
 		{
+			// Not from a debuginfod server: cmd/index-debuginfod sends this for
+			// Ubuntu's libc6-dbg, which debuginfod.ubuntu.com does not index.
+			// cmd/indexer builds it (TestHeaderIsWhatDebDebuginfodParses) and
+			// this is the other end of that contract - break it and Ubuntu libc
+			// sources stop working while debuginfo carries on.
+			name:   "ubuntu libc6-dbg, from cmd/index-debuginfod",
+			header: "/ubuntu/pool/main/g/glibc/libc6-dbg_2.43-2ubuntu2.7_amd64.deb",
+			source: "glibc", version: "2.43-2ubuntu2.7", comp: "main",
+		},
+		{
 			name:   "zlib, modern -dbgsym naming",
 			header: "/srv/mirror/debian-debug/main/z/zlib/zlib1g-dbgsym_1.3.dfsg+really1.3.2-3_amd64.deb",
 			source: "zlib", version: "1.3.dfsg+really1.3.2-3", comp: "main",

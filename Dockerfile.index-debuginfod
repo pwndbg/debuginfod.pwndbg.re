@@ -1,0 +1,17 @@
+# cmd/index-debuginfod reads archives straight off HTTP and needs no tools, so
+# it stays distroless like cmd/deb-debuginfod. cmd/indexer ships in the same
+# image: the two share pkgarchive/ and one build is one thing to keep in sync.
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ ./cmd
+COPY useragent/ ./useragent
+COPY pkgarchive/ ./pkgarchive
+RUN CGO_ENABLED=0 go build -o /out/index-debuginfod ./cmd/index-debuginfod \
+ && CGO_ENABLED=0 go build -o /out/indexer ./cmd/indexer
+
+FROM gcr.io/distroless/static-debian13
+COPY --from=build /out/index-debuginfod /index-debuginfod
+COPY --from=build /out/indexer /indexer
+ENTRYPOINT ["/index-debuginfod"]

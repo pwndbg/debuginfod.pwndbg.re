@@ -2,7 +2,8 @@
 #
 #   ./run.sh          rebuild and recreate the proxy only - the usual redeploy
 #   ./run.sh --deb    only the Debian and Ubuntu source backends (unpacker + server each)
-#   ./run.sh --all    also ClickHouse, releases, the nix backend and the deb ones
+#   ./run.sh --index  only the indexer and the backend serving from its index
+#   ./run.sh --all    also ClickHouse, releases, the nix backend, the deb ones and the index
 #
 set -euo pipefail
 
@@ -157,6 +158,39 @@ deb() {
     "pwndbg-deb-debuginfod"
 }
 
+index() {
+  # Build ids no distribution debuginfod serves: Ubuntu's libc6-dbg (a plain
+  # .deb, which debuginfod.ubuntu.com does not index) and python-build-standalone
+  # (uv's Pythons). One image, two containers: the indexer writes
+  # indexed_buildids, the server reads it. Neither keeps anything on disk.
+  docker build -f Dockerfile.index-debuginfod -t "pwndbg-index-debuginfod" .
+
+  docker rm -f "pwndbg-index-debuginfod" 2>/dev/null || true
+  docker run -d \
+    --name "pwndbg-index-debuginfod" \
+    --restart unless-stopped \
+    --network host \
+    -e LISTEN_ADDR=127.0.0.1:8039 \
+    "pwndbg-index-debuginfod"
+
+  # Every 6 h: a new glibc SRU is servable within hours of reaching the pool.
+  # A run in steady state is two requests: the pool directory listing and the
+  # python-build-standalone tag names. -ubuntu-history (from 20.04, the default
+  # -ubuntu-since; ~10 Launchpad API calls) runs once per container start; finished python releases are never listed
+  # again; nothing is downloaded twice.
+  # GITHUB_TOKEN is taken from this shell: without it the GitHub API allows 60
+  # requests an hour, which one python-build-standalone release exhausts.
+  docker rm -f "pwndbg-indexer" 2>/dev/null || true
+  docker run -d \
+    --name "pwndbg-indexer" \
+    --restart unless-stopped \
+    --network host \
+    -e GITHUB_TOKEN \
+    --entrypoint /indexer \
+    "pwndbg-index-debuginfod" \
+    -every 6h -ubuntu-history
+}
+
 case "${1:-}" in
   "")
     proxy
@@ -170,19 +204,23 @@ case "${1:-}" in
   --deb)
     deb
     ;;
+  --index)
+    index
+    ;;
   --all)
     clickhouse
     proxy
     releases
     nix
     deb
+    index
     ;;
   -h | --help)
-    sed -n '2,6p' "$0"
+    sed -n '2,7p' "$0"
     ;;
   *)
     echo "unknown option: $1" >&2
-    sed -n '2,6p' "$0" >&2
+    sed -n '2,7p' "$0" >&2
     exit 2
     ;;
 esac

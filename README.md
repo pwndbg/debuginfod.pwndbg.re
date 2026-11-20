@@ -30,6 +30,8 @@ This proxy solves that: point your debugger at **one** URL and every build-id lo
 | debian     | https://debuginfod.debian.net               |     ✅     |     ❌      |  ✅🟡   |    ❌    | expire        |
 | ubuntu     | https://debuginfod.ubuntu.com               |     ✅     |     ❌      |  ✅🟡   |    ❌    | expire        |
 | nix        | our own debuginfod server for nix / nixpkgs |     ✅     |     ✅      |   ✅    |    ❌    | kept          |
+| ubuntu-dbg | our own index of Ubuntu's `libc6-dbg`       |     ✅     |     ❌      |  ✅🟡   |    ❌    | kept          |
+| uv-python  | our own index of python-build-standalone    |     ✅     |     ✅      |   ❌    |    ❌    | kept          |
 
 🟡 means there is something to know about that cell:
 
@@ -50,6 +52,16 @@ This proxy solves that: point your debugger at **one** URL and every build-id lo
   record **absolute** paths (`/usr/src/coreutils-9.4-3ubuntu6.3/src/ls.c` on 24.04), so plain GNU
   `libdebuginfod` asks for them; 22.04 records relative ones, with the same caveat as Debian.
   Superseded stable updates disappear from Ubuntu's archive, and their build ids with them.
+- **ubuntu-dbg** — `debuginfod.ubuntu.com` has **no glibc**: Ubuntu ships `libc.so.6` and
+  `ld-linux` debug info in `libc6-dbg`, an ordinary `.deb`, and that server indexes only `.ddeb`
+  packages. So we index `libc6-dbg` ourselves — every version published for 20.04 and later,
+  refreshed every 6 hours — and serve sources for it like for the rest of Ubuntu.
+- **uv-python** — Pythons installed by [uv](https://github.com/astral-sh/uv) come from
+  [python-build-standalone](https://github.com/astral-sh/python-build-standalone), stripped. We
+  serve the unstripped binary from the same release, which has the same build id. Every release from
+  20260825 on — the first with build ids at all
+  ([#1230](https://github.com/astral-sh/python-build-standalone/pull/1230)); older Linux builds
+  carry none, so no debugger can ask for them.
 
 **IMA sig** is the `x-debuginfod-imasignature` header, used to verify what you downloaded. Only the
 Red Hat family sends it.

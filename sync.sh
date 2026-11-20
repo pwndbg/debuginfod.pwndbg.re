@@ -11,7 +11,8 @@ set -euo pipefail
 # Every top-level package a Dockerfile COPYs has to be listed here. The list is
 # explicit rather than a glob, so adding one is a step that is easy to forget -
 # and the failure is remote-only: the image builds here and its COPY fails on
-# the host. srcindex/ is shared by cmd/nix-debuginfod and cmd/deb-debuginfod.
+# the host. srcindex/ is shared by cmd/nix-debuginfod and cmd/deb-debuginfod;
+# pkgarchive/ by cmd/indexer and cmd/index-debuginfod.
 #
 # The deletion is scoped to the trees actually being transferred (cmd/ and the
 # named files), so unrelated contents of the deploy root - cert-cache/,
@@ -20,6 +21,7 @@ rsync -avz --delete \
   "$(pwd)/cmd" \
   "$(pwd)/nix" \
   "$(pwd)/srcindex" \
+  "$(pwd)/pkgarchive" \
   "$(pwd)/useragent" \
   "$(pwd)/go.sum" \
   "$(pwd)/go.mod" \
@@ -29,4 +31,5 @@ rsync -avz --delete \
   "$(pwd)/Dockerfile.releases" \
   "$(pwd)/Dockerfile.deb-unpack" \
   "$(pwd)/Dockerfile.deb-debuginfod" \
+  "$(pwd)/Dockerfile.index-debuginfod" \
   root@host1.cypis.ovh:/persist/debuginfod.pwndbg.re/
