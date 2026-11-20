@@ -41,6 +41,11 @@ func main() {
 		Config.MaxFetches,
 	)
 
+	go globalStore.EvictLoop(ctx, Config.EvictInterval, Config.CacheMaxBytes, Config.MaxMounts)
+	log.WithField("cache_max_bytes", Config.CacheMaxBytes).
+		WithField("max_mounts", Config.MaxMounts).
+		WithField("interval", Config.EvictInterval).Info("eviction enabled")
+
 	db, err := NewDB(ctx, Config.ClickhouseDSN)
 	if err != nil {
 		log.Fatal(err)

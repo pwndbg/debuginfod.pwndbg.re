@@ -75,6 +75,9 @@ nix() {
     --cap-add SYS_ADMIN \
     -e IMAGE_PATH=/var/lib/cache/images \
     -e ENTRY_MOUNT_PATH=/var/lib/cache/entry \
+    -e CACHE_MAX_BYTES=21474836480 \
+    -e MAX_MOUNTS=512 \
+    -e EVICT_INTERVAL=10m \
     -v "nix_cache:/var/lib/cache" \
     "pwndbg-debuginfod-nix2"
 }

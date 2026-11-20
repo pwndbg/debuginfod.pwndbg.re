@@ -19,14 +19,38 @@ Not everything in `cmd/` builds. `go build ./...` currently fails:
   both itself.
 - **`cmd/nix-nar-old`** — builds, deployed. Despite the name, this is what actually runs in
   production as the nix backend (see `Dockerfile.nix`).
-- **`cmd/nix-debuginfod`** — all three endpoints (`debuginfo`, `executable`, `source`) work end to
-  end in tests; **not deployed**, and not yet fit to be. `store.go` fetches a NAR, builds an erofs
-  image, mounts it at the canonical store path and follows symlinks across images lazily. Still
-  missing before it could replace `cmd/nix-nar-old`: eviction of images and mounts (nothing is ever
-  unmounted or deleted), reconciliation of mounts orphaned by `docker rm -f`, and the deployment
-  work (port 8032, `Dockerfile.nix`, `sync.sh` does not send `nix/`). Eviction is now a
-  prerequisite rather than hygiene: a source request may name any store path, so a client can steer
-  what gets downloaded.
+- **`cmd/nix-debuginfod`** — deployed on 8034; `store.go` fetches a NAR, builds an erofs image,
+  mounts it at the canonical store path and follows symlinks across images lazily.
+
+**Eviction here enforces two limits, and they are separate resources** (`evict.go`). `CACHE_MAX_BYTES`
+(20 GiB) bounds the images on disk; `MAX_MOUNTS` (512) bounds the mounts, because each one costs
+kernel memory (~700 kB measured) and counts against `fs.mount-max` — this process can sit well
+inside its byte budget and still be why nothing on the host can mount anything.
+
+The asymmetry between them is the design: **unmounting is nearly free to undo** (the image is still
+on disk, so returning costs one syscall) while deleting an image costs a NAR download and a
+`mkfs.erofs` run. So the mount pass runs first and hard, the byte pass second and gently.
+
+Deliberately **not** deleted: the `archive-<key>.name` sidecars and the `buildid/<id>` symlinks.
+They are a few hundred bytes and they are the memory of which NAR a key came from — keeping them
+means a re-request rebuilds the image without another metadata round trip. `archiveFor` uses
+`os.Readlink`, which succeeds on a dangling link, so this works. Eviction frees the expensive
+bytes, not the cheap knowledge (`TestEvictKeepsArchiveNamesAndBuildIDLinks`).
+
+**Last use is written through to the image's mtime** (`os.Chtimes`, throttled to once an hour per
+image), and that is what makes eviction survive a restart. The in-memory map is empty on every
+start, and this service is redeployed far more often than a 20 GiB budget fills, so "no map" is the
+normal case rather than the exception. Without the write-through, the fallback was the mtime
+`buildOnce` left behind — the moment the image was downloaded, never updated — so ordering was
+"oldest download" rather than "least recently used", and an image fetched months ago and served
+daily would be evicted before one fetched yesterday and never touched
+(`TestLastUseSurvivesARestart`). So mtime here deliberately means **last used**, not "when built";
+nothing else reads it, since `buildOnce` only tests the file for existence.
+
+`touch` is called from `Open`, not from `Ensure`: `Ensure` only runs on a cold path, so a store path
+that stays mounted and busy would otherwise look untouched and be evicted first — exactly backwards.
+`store.unmount` is a seam so the selection logic can be tested without a real mount, the same reason
+`accessLogger` and `stateStore` exist in `cmd/proxy`.
 - Verified end to end against the real binary cache (glibc,
   `8ae0b698f2d4e727f569f64bb166e08ae30bd077`): `debuginfo` and `executable` both come back as ELF
   files whose `.note.gnu.build-id` matches the request, and `source` serves real glibc sources.

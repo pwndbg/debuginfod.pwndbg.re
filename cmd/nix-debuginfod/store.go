@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"sync"
+	"time"
 
 	"github.com/pwndbg/debuginfod.pwndbg.re/srcindex"
 
@@ -77,6 +78,17 @@ type store struct {
 
 	idxMu sync.Mutex
 	idx   map[string]*srcindex.Index // mounted tree -> its file index
+
+	// used records when each image was last served, so eviction can order by
+	// demand rather than by download time. In memory only: a restart falls back
+	// to mtime, which at least orders the images among themselves.
+	usedMu sync.Mutex
+	used   map[string]time.Time
+
+	// unmount is a seam so eviction can be tested without a real mount. It is
+	// unmountErofs everywhere except in tests; the same reason accessLogger and
+	// stateStore exist in cmd/proxy.
+	unmount func(target string) error
 }
 
 func newStore(fetcher narFetcher, imageDir, mountRoot, entryRoot string, maxFetches int) *store {
@@ -115,6 +127,7 @@ func newStore(fetcher narFetcher, imageDir, mountRoot, entryRoot string, maxFetc
 	}
 	return &store{
 		fetcher:   fetcher,
+		unmount:   unmountErofs,
 		imageDir:  imageDir,
 		mountRoot: mountRoot,
 		entryRoot: entryRoot,
@@ -313,6 +326,10 @@ func (s *store) Open(ctx context.Context, path string) (*os.File, int, error) {
 	for hop := 0; hop < maxResolveHops; hop++ {
 		f, err := os.Open(path)
 		if err == nil {
+			// Touched here, not in Ensure: Ensure only runs on a cold path, so
+			// a store path that stays mounted and busy would otherwise look
+			// untouched and be evicted first - exactly backwards.
+			s.touchPath(path)
 			return f, hop, nil
 		}
 		if !errors.Is(err, fs.ErrNotExist) {
@@ -510,6 +527,7 @@ func (s *store) entry(ctx context.Context, buildID string, w http.ResponseWriter
 
 	point = filepath.Join(s.entryRoot, key)
 	image := filepath.Join(s.imageDir, "archive-"+key+".erofs")
+	s.touch(image)
 
 	_, err, _ = s.group.Do("archive:"+key, func() (any, error) {
 		if err := s.buildOnce(ctx, image, func(tmp string) error {
