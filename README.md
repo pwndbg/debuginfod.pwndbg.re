@@ -28,6 +28,7 @@ This proxy solves that: point your debugger at **one** URL and every build-id lo
 | artixlinux | https://debuginfod.artixlinux.org           |     ✅     |     ❌      |   ✅    |    ❌    | expire        |
 | cachyos    | https://debuginfod.cachyos.org              |     ✅     |     ❌      |   ✅    |    ❌    | expire        |
 | debian     | https://debuginfod.debian.net               |     ✅     |     ❌      |  ✅🟡   |    ❌    | expire        |
+| ubuntu     | https://debuginfod.ubuntu.com               |     ✅     |     ❌      |  ✅🟡   |    ❌    | expire        |
 | nix        | our own debuginfod server for nix / nixpkgs |     ✅     |     ✅      |   ✅    |    ❌    | kept          |
 
 🟡 means there is something to know about that cell:
@@ -45,6 +46,10 @@ This proxy solves that: point your debugger at **one** URL and every build-id lo
   that can ask for them: Debian records **relative** source paths in DWARF (`./csu` plus
   `../sysdeps/x86/abi-note.c`), and GNU `libdebuginfod` only handles absolute ones, so it never
   sends the request. [debuginfod-zig](https://github.com/pwndbg/debuginfod-zig) handles both.
+- **ubuntu** — likewise serves no sources of its own, and we serve them the same way. Newer releases
+  record **absolute** paths (`/usr/src/coreutils-9.4-3ubuntu6.3/src/ls.c` on 24.04), so plain GNU
+  `libdebuginfod` asks for them; 22.04 records relative ones, with the same caveat as Debian.
+  Superseded stable updates disappear from Ubuntu's archive, and their build ids with them.
 
 **IMA sig** is the `x-debuginfod-imasignature` header, used to verify what you downloaded. Only the
 Red Hat family sends it.
@@ -60,19 +65,18 @@ contacted, so a build id only they would have comes back as not found.
 
 | Name      | URL                                | Why                                          |
 | --------- | ---------------------------------- | -------------------------------------------- |
-| ubuntu    | https://debuginfod.ubuntu.com      | disabled — requests hung for ~45 s and never completed |
 | alpine    | https://debuginfod.achill.org      | disabled — server offline                    |
 | elfutils  | https://debuginfod.elfutils.org    | disabled — server misbehaves                 |
 | voidlinux | https://debuginfod.s.voidlinux.org | never configured                             |
 | altlinux  | https://debuginfod.altlinux.org    | never configured                             |
 
-## Debian sources
+## Debian and Ubuntu sources
 
-`debuginfod.debian.net` serves debug info and executables, but returns 404 for **every** source
-path — so on Debian you get disassembly and symbol names, and no source lines.
+`debuginfod.debian.net` and `debuginfod.ubuntu.com` serve debug info, but return 404 for **every**
+source path — so on Debian and Ubuntu you get disassembly and symbol names, and no source lines.
 
-We fill that gap ourselves: a Debian build id is resolved to the source package it came from, which
-is fetched and unpacked **with the Debian patch series applied**, because the pristine upstream
+We fill that gap ourselves: a build id is resolved to the source package it came from, which
+is fetched and unpacked **with the distribution's patch series applied**, because the pristine upstream
 sources do not line up with the debugger's line numbers. This is new — if a source path should
 resolve and does not, please [open an issue](https://github.com/pwndbg/debuginfod.pwndbg.re/issues).
 

@@ -2,7 +2,8 @@ package main
 
 import "testing"
 
-// Every header here is real, taken from debuginfod.debian.net.
+// Every header here is real, taken from debuginfod.debian.net or
+// debuginfod.ubuntu.com.
 func TestParseArchive(t *testing.T) {
 	for _, tc := range []struct {
 		name, header          string
@@ -43,6 +44,17 @@ func TestParseArchive(t *testing.T) {
 			name:   "contrib keeps its component",
 			header: "/srv/mirror/debian-debug/dbg-contrib/n/nvidia/foo-dbgsym_1-1_amd64.deb",
 			source: "nvidia", version: "1-1", comp: "contrib",
+		},
+		{
+			// Ubuntu: a .ddeb, and the component has no dbg- prefix.
+			name:   "ubuntu ddeb",
+			header: "/srv/debug-mirror/ddebs/main/c/coreutils/coreutils-dbgsym_9.4-3ubuntu6.3_amd64.ddeb",
+			source: "coreutils", version: "9.4-3ubuntu6.3", comp: "main",
+		},
+		{
+			name:   "ubuntu universe",
+			header: "/srv/debug-mirror/ddebs/universe/libf/libfoo/libfoo1-dbgsym_1.2-3ubuntu1_arm64.ddeb",
+			source: "libfoo", version: "1.2-3ubuntu1", comp: "universe",
 		},
 
 		{name: "too short", header: "/srv/mirror/x.deb", wantErr: true},

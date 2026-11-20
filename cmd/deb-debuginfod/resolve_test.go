@@ -22,7 +22,7 @@ func testSrv(t *testing.T, h http.HandlerFunc) (*srv, *int64) {
 	}))
 	t.Cleanup(backend.Close)
 	return &srv{
-		debian:   backend.URL,
+		upstream: backend.URL,
 		hc:       useragent.Client(backend.Client(), "deb"),
 		resolved: expirable.NewLRU[string, pkgRef](resolveCacheSize, nil, resolveCacheTTL),
 	}, &calls
@@ -114,7 +114,7 @@ func TestOutboundRequestsIdentifyTheProject(t *testing.T) {
 	defer backend.Close()
 
 	s := &srv{
-		debian:   backend.URL,
+		upstream: backend.URL,
 		hc:       useragent.Client(backend.Client(), "deb"),
 		resolved: expirable.NewLRU[string, pkgRef](resolveCacheSize, nil, resolveCacheTTL),
 	}

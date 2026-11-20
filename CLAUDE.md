@@ -276,7 +276,7 @@ suppressed for 30m after the 1st failure, 1h after the 2nd, 2h after the 3rd, th
 constants changes the load profile against every upstream at once.
 
 **Source handling**: `Server.SourceAvailable` marks upstreams that serve `/source/*`. Debian and
-Ubuntu are 0. For the `source` endpoint the finder converts both "not found" and
+Ubuntu are 0 and hand sources to delegates (`debian-src`, `ubuntu-src`) instead. For the `source` endpoint the finder converts both "not found" and
 "host has no sources" into `ErrSourceNotImplemented` → HTTP 501, deliberately so results stay
 cacheable per build ID.
 
@@ -687,7 +687,7 @@ things.
 `response_headers` in that table is always empty: the middleware reads `x-debuginfod-*` headers and
 no handler here sets any. Either start emitting them (the protocol has them) or drop the column.
 
-### Debian source backend (`cmd/deb-debuginfod` + `cmd/deb-unpack`, WIP)
+### Debian and Ubuntu source backend (`cmd/deb-debuginfod` + `cmd/deb-unpack`, WIP)
 
 **No index of our own is needed, and that is the whole reason this is cheap.** `debuginfod.debian.net`
 answers `/buildid/<id>/debuginfo` with an `X-DEBUGINFOD-ARCHIVE` header naming the exact `.deb`:
@@ -764,13 +764,32 @@ volume, 200 MB budget, glibc evicted, 3.1 MB left, and the next request for it r
 set is open-ended and pruning by extension would reintroduce exactly the silent-wrong-answer class
 the patching fixes.
 
-`sync.sh` sends `srcindex/` and both Dockerfiles, and `run.sh --deb` builds and starts the pair.
+**Ubuntu runs on the same two binaries, as a second pair** (`pwndbg-ubuntu-unpack` on 8037,
+`pwndbg-ubuntu-debuginfod` on 8038, volume `ubuntu_src`), configured by `MIRROR` and
+`UPSTREAM_DEBUGINFOD`. What differs, verified against the real servers:
+
+- The header names a `.ddeb` with a plain component —
+  `/srv/debug-mirror/ddebs/main/c/coreutils/coreutils-dbgsym_9.4-3ubuntu6.3_amd64.ddeb` — and the
+  components include `universe`, `restricted`, `multiverse`. `archive.ubuntu.com/ubuntu/pool` has
+  Debian's layout, so nothing else changes.
+- `debuginfod.ubuntu.com` 404s every source path, including the one its own DWARF names: from 24.04
+  packages carry `comp_dir = /usr/src/<source>-<version>`, the layout for serving, with no server
+  behind it. 22.04 still has `comp_dir = .`.
+- **A second pair, not a second distro inside one.** The server evicts whatever the unpacker's
+  `/trees` lists, so two servers on one volume would each evict the other's trees by mtime, never
+  having seen their traffic — the same "one owner per volume" rule as above.
+- **No Launchpad fallback, deliberately.** The pool drops superseded stable updates
+  (`coreutils 8.32-4.1ubuntu1.2` is gone, Launchpad still has it), which looks like a gap — but
+  `ddebs.ubuntu.com` drops exactly the same versions, so `debuginfod.ubuntu.com` 404s those build IDs
+  too and they never reach the delegate. A fallback was written and removed; it could not fire.
+
+`sync.sh` sends `srcindex/` and both Dockerfiles, and `run.sh --deb` builds and starts both pairs.
 Note `sync.sh` lists top-level packages **explicitly**, not by glob: forgetting one is a remote-only
 failure, where the image builds locally and its `COPY` fails on the host.
 
 **`cmd/proxy` routes to it through a delegate, not an upstream.** `Server.SourceVia` names a server
 that serves `/source/*` for build IDs this one resolves but cannot supply sources for; `debian`
-points at `debian-src`, and `applySourceRules` (the single place where "resolved but no sources"
+points at `debian-src`, `ubuntu` at `ubuntu-src`, and `applySourceRules` (the single place where "resolved but no sources"
 becomes a 501, shared by the fast and slow paths) hands the request over instead.
 
 Delegates live in their own map and are **deliberately not in `servers`**: `tryAllServers` probes

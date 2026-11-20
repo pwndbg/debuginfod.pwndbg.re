@@ -34,7 +34,7 @@ type Server struct {
 	// server resolves but cannot supply sources for. debuginfod.debian.net is
 	// the case it exists for: it answers debuginfo and executable well and
 	// 404s every source path, so without a delegate every Debian source
-	// request is a 501.
+	// request is a 501. debuginfod.ubuntu.com behaves the same way.
 	SourceVia string
 }
 
@@ -71,7 +71,8 @@ const maxResolutionTimeout = 5 * time.Second
 // responseHeaderTimeout caps the time from sending the request to receiving the
 // response headers. It guards against an upstream that accepts the connection and
 // then goes silent without sending anything - which is how debuginfod.ubuntu.com
-// behaves: TCP and TLS come up in ~80 ms and then not a single byte arrives.
+// behaved for months (it was marked Down until 2026-11): TCP and TLS came up in
+// ~80 ms and then not a single byte arrived.
 // Without this limit such a request hangs until the context deadline, and for
 // content fetches that deadline is the server's WriteTimeout, i.e. 60 minutes.
 //
@@ -181,6 +182,11 @@ func NewDebugInfoFinder(db stateStore) *DebugInfoFinder {
 			// nothing here needs HTTP/2 - there are no Early Hints to send when
 			// the answer is a small text file.
 			"debian-src": {Name: "debian-src", Down: false, SourceAvailable: 1, URL: "http://127.0.0.1:8036"},
+			// The same binaries again, pointed at debuginfod.ubuntu.com and
+			// archive.ubuntu.com. Ubuntu builds its packages with comp_dir set
+			// to /usr/src/<source>-<version>, i.e. ready to be served, and
+			// debuginfod.ubuntu.com still 404s exactly that path.
+			"ubuntu-src": {Name: "ubuntu-src", Down: false, SourceAvailable: 1, URL: "http://127.0.0.1:8038"},
 		},
 		servers: map[string]*Server{
 			//{Name: "elfutils", URL: "https://debuginfod.elfutils.org"},  // bugged
@@ -192,7 +198,7 @@ func NewDebugInfoFinder(db stateStore) *DebugInfoFinder {
 			"cachyos":    {Name: "cachyos", Down: false, SourceAvailable: 1, URL: "https://debuginfod.cachyos.org"},
 			"centos":     {Name: "centos", Down: false, SourceAvailable: 1, URL: "https://debuginfod.centos.org"},
 			"debian":     {Name: "debian", Down: false, SourceAvailable: 0, URL: "https://debuginfod.debian.net", SourceVia: "debian-src"},
-			"ubuntu":     {Name: "ubuntu", Down: true, SourceAvailable: 0, URL: "https://debuginfod.ubuntu.com"},
+			"ubuntu":     {Name: "ubuntu", Down: false, SourceAvailable: 0, URL: "https://debuginfod.ubuntu.com", SourceVia: "ubuntu-src"},
 			//"alpine":     {Name: "alpine", Down: false, SourceAvailable: 0, URL: "https://debuginfod.achill.org"}, // offline
 			// https, and on 8034: cmd/nix-debuginfod serves TLS so that HTTP/2 -
 			// and with it 103 Early Hints - is available on the connection this

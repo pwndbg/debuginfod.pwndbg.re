@@ -6,11 +6,11 @@ import (
 	"strings"
 )
 
-// pkgRef identifies a Debian source package version.
+// pkgRef identifies a Debian or Ubuntu source package version.
 type pkgRef struct {
 	Source    string // source package, e.g. glibc
 	Version   string // source version, e.g. 2.41-12+deb13u3
-	Component string // main, contrib, non-free, non-free-firmware
+	Component string // main, contrib, non-free, non-free-firmware; on Ubuntu main, universe, restricted, multiverse
 }
 
 // binNMU matches the +bN suffix a binary-only rebuild appends. Such a version
@@ -38,6 +38,12 @@ var binNMU = regexp.MustCompile(`\+b[0-9]+$`)
 //     package name in the filename (libc6-dbg). They differ for most packages,
 //     and libc6-dbg is also the pre-dbgsym naming, so the filename cannot even
 //     be relied on to follow one convention.
+//
+// debuginfod.ubuntu.com answers in the same shape, with two differences: the
+// file is a .ddeb (Ubuntu ships debug symbols as a separate package type, not
+// in the archive proper) and the component carries no dbg- prefix:
+//
+//	/srv/debug-mirror/ddebs/main/c/coreutils/coreutils-dbgsym_9.4-3ubuntu6.3_amd64.ddeb
 func parseArchive(header string) (pkgRef, error) {
 	parts := strings.Split(strings.Trim(header, "/"), "/")
 	if len(parts) < 4 {
@@ -50,14 +56,19 @@ func parseArchive(header string) (pkgRef, error) {
 	component, source, file := tail[0], tail[2], tail[3]
 
 	component = strings.TrimPrefix(component, "dbg-")
-	if !strings.HasSuffix(file, ".deb") {
-		return pkgRef{}, fmt.Errorf("archive is not a .deb: %q", file)
+	var name string
+	switch {
+	case strings.HasSuffix(file, ".deb"):
+		name = strings.TrimSuffix(file, ".deb")
+	case strings.HasSuffix(file, ".ddeb"):
+		name = strings.TrimSuffix(file, ".ddeb")
+	default:
+		return pkgRef{}, fmt.Errorf("archive is not a .deb or .ddeb: %q", file)
 	}
 
 	// <binary>_<version>_<arch>.deb - the version is what lies between the
 	// first and last underscore, because a binary package name may not contain
 	// one but an architecture never does.
-	name := strings.TrimSuffix(file, ".deb")
 	first := strings.Index(name, "_")
 	last := strings.LastIndex(name, "_")
 	if first < 0 || last <= first {

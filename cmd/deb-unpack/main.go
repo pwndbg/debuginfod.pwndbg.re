@@ -18,6 +18,12 @@
 //
 // Deliberately NOT reachable from anywhere but the serving container: it takes
 // a package name and shells out, so it is an internal component, not an API.
+//
+// Ubuntu runs as a second instance of the same binary with its own volume and
+// MIRROR pointed at archive.ubuntu.com, whose pool has the same layout. No
+// fallback to Launchpad for versions the pool has dropped: ddebs.ubuntu.com
+// drops the same versions at the same time, so debuginfod.ubuntu.com does not
+// resolve those build IDs either and they never reach this service.
 package main
 
 import (
@@ -58,7 +64,9 @@ const staleUnpackAge = 2 * time.Hour
 var (
 	rePackage = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]{1,63}$`)
 	reVersion = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.+~-]{0,63}$`)
-	reComp    = regexp.MustCompile(`^(main|contrib|non-free|non-free-firmware)$`)
+	// Debian's components, then Ubuntu's. One list for both: a Debian instance
+	// asked for "universe" simply gets a 404 from its mirror.
+	reComp = regexp.MustCompile(`^(main|contrib|non-free|non-free-firmware|universe|restricted|multiverse)$`)
 )
 
 type unpackRequest struct {
@@ -86,7 +94,7 @@ func main() {
 	var (
 		addr   = envOr("LISTEN_ADDR", "127.0.0.1:8035")
 		root   = envOr("UNPACK_PATH", "/var/lib/deb-src")
-		mirror = envOr("DEBIAN_MIRROR", "https://deb.debian.org/debian")
+		mirror = envOr("MIRROR", "https://deb.debian.org/debian")
 	)
 	if _, err := exec.LookPath("dpkg-source"); err != nil {
 		// Fatal rather than degraded: without dpkg-source this service can do
@@ -123,7 +131,7 @@ func main() {
 		}
 	}()
 
-	log.WithField("addr", addr).WithField("root", root).Info("deb-unpack starting")
+	log.WithField("addr", addr).WithField("root", root).WithField("mirror", mirror).Info("deb-unpack starting")
 	if err := srv.ListenAndServe(); err != nil {
 		log.WithError(err).Fatal("server failed")
 	}

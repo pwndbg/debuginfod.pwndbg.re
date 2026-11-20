@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 #   ./run.sh          rebuild and recreate the proxy only - the usual redeploy
-#   ./run.sh --deb    only the Debian source backend (unpacker + server)
-#   ./run.sh --all    also ClickHouse, releases, the nix backend and the Debian one
+#   ./run.sh --deb    only the Debian and Ubuntu source backends (unpacker + server each)
+#   ./run.sh --all    also ClickHouse, releases, the nix backend and the deb ones
 #
 set -euo pipefail
 
@@ -117,6 +117,34 @@ deb() {
     -e CACHE_MAX_BYTES=21474836480 \
     -e EVICT_INTERVAL=10m \
     -v "deb_src:/var/lib/deb-src:ro" \
+    "pwndbg-deb-debuginfod"
+
+  # Ubuntu: the same two images, a second pair of containers. Its own volume and
+  # its own eviction budget rather than sharing Debian's, because the server
+  # evicts whatever the unpacker lists - two servers on one volume would each
+  # evict the other's trees by mtime, never having seen their traffic.
+  docker rm -f "pwndbg-ubuntu-unpack" 2>/dev/null || true
+  docker run -d \
+    --name "pwndbg-ubuntu-unpack" \
+    --restart unless-stopped \
+    --network host \
+    -e LISTEN_ADDR=127.0.0.1:8037 \
+    -e UNPACK_PATH=/var/lib/deb-src \
+    -e MIRROR=https://archive.ubuntu.com/ubuntu \
+    -v "ubuntu_src:/var/lib/deb-src" \
+    "pwndbg-deb-unpack"
+
+  docker rm -f "pwndbg-ubuntu-debuginfod" 2>/dev/null || true
+  docker run -d \
+    --name "pwndbg-ubuntu-debuginfod" \
+    --restart unless-stopped \
+    --network host \
+    -e LISTEN_ADDR=127.0.0.1:8038 \
+    -e UPSTREAM_DEBUGINFOD=https://debuginfod.ubuntu.com \
+    -e UNPACKER_URL=http://127.0.0.1:8037 \
+    -e CACHE_MAX_BYTES=21474836480 \
+    -e EVICT_INTERVAL=10m \
+    -v "ubuntu_src:/var/lib/deb-src:ro" \
     "pwndbg-deb-debuginfod"
 }
 

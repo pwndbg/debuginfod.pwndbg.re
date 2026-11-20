@@ -1,5 +1,8 @@
 // Command deb-debuginfod serves /buildid/<id>/source/<path> for Debian build
-// IDs, and nothing else.
+// IDs, and nothing else. The same binary serves Ubuntu as a second instance,
+// pointed at debuginfod.ubuntu.com and archive.ubuntu.com by environment (see
+// run.sh); everything below holds for both, with Ubuntu's differences noted
+// where they arise.
 //
 // Why only source: debuginfod.debian.net already serves debuginfo and
 // executable well, and cmd/proxy resolves to it. What it does NOT serve is
@@ -45,9 +48,10 @@ import (
 )
 
 const (
-	// debianDebuginfod is asked for headers only; it is the authority on which
-	// .deb a build ID belongs to.
-	debianDebuginfod = "https://debuginfod.debian.net"
+	// defaultUpstream is asked for headers only; it is the authority on which
+	// .deb a build ID belongs to. UPSTREAM_DEBUGINFOD overrides it, which is
+	// how the Ubuntu instance points at debuginfod.ubuntu.com.
+	defaultUpstream = "https://debuginfod.debian.net"
 
 	// resolveTimeout bounds the header lookup. It is short because the answer
 	// is a header, not a payload - if Debian is slow enough to exceed this, the
@@ -71,10 +75,11 @@ const (
 )
 
 type srv struct {
-	// debian is the authority on which .deb a build ID belongs to. A field
+	// upstream is the authority on which .deb a build ID belongs to. A field
 	// rather than the constant so a test can stand in for it and count how
-	// often it is actually asked.
-	debian   string
+	// often it is actually asked, and so one binary can serve both Debian and
+	// Ubuntu.
+	upstream string
 	unpacker string
 	hc       *http.Client
 
@@ -94,7 +99,7 @@ type srv struct {
 func main() {
 	addr := envOr("LISTEN_ADDR", "127.0.0.1:8036")
 	s := &srv{
-		debian:   envOr("DEBIAN_DEBUGINFOD", debianDebuginfod),
+		upstream: envOr("UPSTREAM_DEBUGINFOD", defaultUpstream),
 		unpacker: envOr("UNPACKER_URL", "http://127.0.0.1:8035"),
 		indexes:  map[string]*srcindex.Index{},
 		lastUsed: map[string]time.Time{},
@@ -109,8 +114,8 @@ func main() {
 	// Answered explicitly rather than left to 404 so a misconfigured caller
 	// learns what this service is, instead of concluding the build ID is
 	// unknown. cmd/proxy should route only source here.
-	router.GET("/buildid/:buildid/debuginfo", notImplemented)
-	router.GET("/buildid/:buildid/executable", notImplemented)
+	router.GET("/buildid/:buildid/debuginfo", s.notImplemented)
+	router.GET("/buildid/:buildid/executable", s.notImplemented)
 	router.GET("/status", func(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -124,7 +129,7 @@ func main() {
 	interval := envDuration("EVICT_INTERVAL", 10*time.Minute)
 	go s.EvictLoop(context.Background(), interval, budget)
 
-	log.WithField("addr", addr).WithField("unpacker", s.unpacker).
+	log.WithField("addr", addr).WithField("upstream", s.upstream).WithField("unpacker", s.unpacker).
 		WithField("cache_max_bytes", budget).Info("deb-debuginfod starting")
 	if err := server.ListenAndServe(); err != nil {
 		log.WithError(err).Fatal("server failed")
@@ -158,8 +163,8 @@ func envOr(k, def string) string {
 	return def
 }
 
-func notImplemented(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
-	http.Error(w, "this backend serves /source/* only; debuginfo and executable come from debuginfod.debian.net",
+func (s *srv) notImplemented(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
+	http.Error(w, "this backend serves /source/* only; debuginfo and executable come from "+s.upstream,
 		http.StatusNotImplemented)
 }
 
@@ -171,7 +176,7 @@ func (s *srv) handleSource(w http.ResponseWriter, r *http.Request, ps httprouter
 
 	pkg, err := s.resolve(r.Context(), buildID)
 	if err != nil {
-		logger.WithError(err).Debug("build ID does not resolve to a Debian package")
+		logger.WithError(err).Debug("build ID does not resolve to a package upstream")
 		http.Error(w, "unknown build ID", http.StatusNotFound)
 		return
 	}
@@ -220,7 +225,7 @@ func (s *srv) handleSource(w http.ResponseWriter, r *http.Request, ps httprouter
 		Info("served source")
 }
 
-// resolve asks Debian which package a build ID belongs to.
+// resolve asks the upstream debuginfod which package a build ID belongs to.
 //
 // It reads the headers and closes the body immediately: the debuginfo payload
 // is megabytes and none of it is wanted. HEAD is not used because debuginfod
@@ -231,10 +236,10 @@ func (s *srv) resolve(ctx context.Context, buildID string) (pkgRef, error) {
 		return pkg, nil
 	}
 	res, err, _ := s.resolveGroup.Do(buildID, func() (any, error) {
-		pkg, err := s.askDebian(ctx, buildID)
+		pkg, err := s.askUpstream(ctx, buildID)
 		if err != nil {
 			// Deliberately not cached. A negative answer here is usually
-			// "Debian was slow" rather than "this build ID does not exist",
+			// "upstream was slow" rather than "this build ID does not exist",
 			// and remembering it for a day would turn a blip into an outage
 			// for that build ID.
 			return pkgRef{}, err
@@ -248,11 +253,11 @@ func (s *srv) resolve(ctx context.Context, buildID string) (pkgRef, error) {
 	return res.(pkgRef), nil
 }
 
-func (s *srv) askDebian(ctx context.Context, buildID string) (pkgRef, error) {
+func (s *srv) askUpstream(ctx context.Context, buildID string) (pkgRef, error) {
 	ctx, cancel := context.WithTimeout(ctx, resolveTimeout)
 	defer cancel()
 
-	url := s.debian + "/buildid/" + buildID + "/debuginfo"
+	url := s.upstream + "/buildid/" + buildID + "/debuginfo"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return pkgRef{}, err
@@ -264,7 +269,7 @@ func (s *srv) askDebian(ctx context.Context, buildID string) (pkgRef, error) {
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return pkgRef{}, fmt.Errorf("debian answered %s", resp.Status)
+		return pkgRef{}, fmt.Errorf("upstream answered %s", resp.Status)
 	}
 
 	archive := resp.Header.Get("x-debuginfod-archive")
