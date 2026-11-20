@@ -146,7 +146,7 @@ func main() {
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	budget := envInt("CACHE_MAX_BYTES", 20<<30)
+	budget := envInt("CACHE_MAX_BYTES", 10<<30)
 	interval := envDuration("EVICT_INTERVAL", 10*time.Minute)
 	go s.EvictLoop(context.Background(), interval, budget)
 

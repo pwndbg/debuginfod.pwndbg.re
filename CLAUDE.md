@@ -23,7 +23,7 @@ Not everything in `cmd/` builds. `go build ./...` currently fails:
   mounts it at the canonical store path and follows symlinks across images lazily.
 
 **Eviction here enforces two limits, and they are separate resources** (`evict.go`). `CACHE_MAX_BYTES`
-(20 GiB) bounds the images on disk; `MAX_MOUNTS` (512) bounds the mounts, because each one costs
+(10 GiB) bounds the images on disk; `MAX_MOUNTS` (512) bounds the mounts, because each one costs
 kernel memory (~700 kB measured) and counts against `fs.mount-max` — this process can sit well
 inside its byte budget and still be why nothing on the host can mount anything.
 
@@ -39,7 +39,7 @@ bytes, not the cheap knowledge (`TestEvictKeepsArchiveNamesAndBuildIDLinks`).
 
 **Last use is written through to the image's mtime** (`os.Chtimes`, throttled to once an hour per
 image), and that is what makes eviction survive a restart. The in-memory map is empty on every
-start, and this service is redeployed far more often than a 20 GiB budget fills, so "no map" is the
+start, and this service is redeployed far more often than a 10 GiB budget fills, so "no map" is the
 normal case rather than the exception. Without the write-through, the fallback was the mtime
 `buildOnce` left behind — the moment the image was downloaded, never updated — so ordering was
 "oldest download" rather than "least recently used", and an image fetched months ago and served
@@ -789,7 +789,7 @@ unpacker to act. Two orderings are load-bearing and have tests:
 Ordering is by last *request*, and **the last request is written through to the tree's mtime**
 (`POST /touch/{component}/{name}` on the unpacker, throttled to once an hour per package). That
 write-through is what keeps the ordering meaningful across a restart: the in-memory map is empty on
-every start, and this service is redeployed far more often than a 20 GiB budget fills, so "no map"
+every start, and this service is redeployed far more often than a 10 GiB budget fills, so "no map"
 is the normal case rather than the exception — and the bare fallback, the time a tree was unpacked,
 cannot tell a package fetched once from one serving a debugger all week. It goes through the
 unpacker for the same reason deletion does: the serving container mounts the volume read-only, so
@@ -798,7 +798,7 @@ eviction ordering after the next restart, not correctness now. A zero or negativ
 in the config does not delete everything on the first tick. Verified end to end: 297 MB on the
 volume, 200 MB budget, glibc evicted, 3.1 MB left, and the next request for it rebuilt in 2.1 s.
 
-`CACHE_MAX_BYTES` (20 GiB) and `EVICT_INTERVAL` (10 m) configure it. Pruning to `.c/.h/.S` would cut 251 MB to ~110 MB but was
+`CACHE_MAX_BYTES` (10 GiB) and `EVICT_INTERVAL` (10 m) configure it. Pruning to `.c/.h/.S` would cut 251 MB to ~110 MB but was
 **rejected**: DWARF names compilation units, while headers come from the line table, so the servable
 set is open-ended and pruning by extension would reintroduce exactly the silent-wrong-answer class
 the patching fixes.

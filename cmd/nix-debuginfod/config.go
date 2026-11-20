@@ -27,7 +27,7 @@ type configEnv struct {
 	// into erofs at once. Each one is a NAR download plus an mkfs.erofs process.
 	// Two independent limits, because images and mounts are separate resources.
 	//
-	// 20 GiB matches cmd/deb-debuginfod, but the sweep is gentler here: an
+	// 10 GiB matches cmd/deb-debuginfod, but the sweep is gentler here: an
 	// evicted image costs a NAR download and a mkfs.erofs run to bring back,
 	// against about two seconds there.
 	//
@@ -36,7 +36,7 @@ type configEnv struct {
 	// process can sit well inside its byte budget and still be why nothing on
 	// the host can mount anything. Unmounting is nearly free to undo - the image
 	// stays on disk - so this limit can be enforced hard.
-	CacheMaxBytes int64         `env:"CACHE_MAX_BYTES" envDefault:"21474836480"` // 20 GiB
+	CacheMaxBytes int64         `env:"CACHE_MAX_BYTES" envDefault:"10737418240"` // 10 GiB
 	MaxMounts     int           `env:"MAX_MOUNTS" envDefault:"512"`
 	EvictInterval time.Duration `env:"EVICT_INTERVAL" envDefault:"10m"`
 

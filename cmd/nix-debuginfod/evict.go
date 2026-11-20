@@ -47,7 +47,7 @@ const touchPersistInterval = time.Hour
 // redeploy - so ordering fell back to the file's mtime, which was the moment
 // buildOnce created it and never changed afterwards. That is "oldest download",
 // not "least recently used", and since this service is redeployed far more often
-// than a 20 GiB budget fills, that fallback was the normal case rather than the
+// than a 10 GiB budget fills, that fallback was the normal case rather than the
 // exception: a package fetched in August and served every day since would be
 // evicted before one fetched yesterday and never touched again.
 //

@@ -28,7 +28,7 @@ const touchPersistInterval = time.Hour
 //
 // The write-through is what makes the ordering survive a restart. The map is
 // empty on every start, and this service is redeployed far more often than a
-// 20 GiB budget fills, so "no map" is the normal case rather than the
+// 10 GiB budget fills, so "no map" is the normal case rather than the
 // exception - without it, ordering falls back to when a tree was unpacked,
 // which cannot tell a package fetched once from one serving a debugger all week.
 //

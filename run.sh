@@ -75,7 +75,7 @@ nix() {
     --cap-add SYS_ADMIN \
     -e IMAGE_PATH=/var/lib/cache/images \
     -e ENTRY_MOUNT_PATH=/var/lib/cache/entry \
-    -e CACHE_MAX_BYTES=21474836480 \
+    -e CACHE_MAX_BYTES=10737418240 \
     -e MAX_MOUNTS=512 \
     -e EVICT_INTERVAL=10m \
     -v "nix_cache:/var/lib/cache" \
@@ -95,7 +95,7 @@ deb() {
   # them. The server also drives eviction and calls back to the unpacker to do
   # the deleting, because only the unpacker mounts the volume writable.
   #
-  # 20 GiB is roughly 80 source packages at glibc's 251 MB, and far more at a
+  # 10 GiB is roughly 40 source packages at glibc's 251 MB, and far more at a
   # typical package's size. Rebuilding one costs ~2 s, so being wrong here is
   # cheap in a way it is not for the nix backend.
   docker rm -f "pwndbg-deb-unpack" 2>/dev/null || true
@@ -118,7 +118,7 @@ deb() {
     --network host \
     -e LISTEN_ADDR=127.0.0.1:8036 \
     -e UNPACKER_URL=http://127.0.0.1:8035 \
-    -e CACHE_MAX_BYTES=21474836480 \
+    -e CACHE_MAX_BYTES=10737418240 \
     -e EVICT_INTERVAL=10m \
     -v "deb_src:/var/lib/deb-src:ro" \
     "pwndbg-deb-debuginfod"
@@ -151,7 +151,7 @@ deb() {
     -e LISTEN_ADDR=127.0.0.1:8038 \
     -e UPSTREAM_DEBUGINFOD=https://debuginfod.ubuntu.com \
     -e UNPACKER_URL=http://127.0.0.1:8037 \
-    -e CACHE_MAX_BYTES=21474836480 \
+    -e CACHE_MAX_BYTES=10737418240 \
     -e EVICT_INTERVAL=10m \
     -v "ubuntu_src:/var/lib/deb-src:ro" \
     "pwndbg-deb-debuginfod"
