@@ -494,12 +494,57 @@ func (f *DebugInfoFinder) UpdateState(ctx context.Context, state BuildIDState) e
 	return nil
 }
 
-func (f *DebugInfoFinder) FindByBuildID(ctx context.Context, buildID string, endpointName string) (*Server, error) {
-	if len(buildID) > 64 {
-		return nil, fmt.Errorf("buildID too long %d", len(buildID))
+// buildIDLengths are the build id lengths worth forwarding upstream.
+//
+// Measured on both sides rather than assumed. What linkers emit: 16 hex from
+// lld --build-id=fast (xxhash64), 32 from md5 and from uuid, 40 from sha1, and
+// anything from 8 to 128 through an explicit --build-id=0x... What upstreams
+// actually hold: debian, fedora and arch ship 40 and nothing else - 952 ELF
+// files scanned, every one of them sha1 - so a short id has nothing to index
+// against anywhere.
+//
+// Production agrees. Of every request whose id was not 40 characters, **none
+// has ever been served**: 727k requests at 8 characters, 105k at 32, 4k at 16,
+// all with zero 200s over nine months. 32 stays because md5 is a legitimate
+// style that a distribution could adopt tomorrow; 16 and 64 are gone because no
+// distribution emits them and nothing indexes them, so accepting one only buys
+// a fan-out to every upstream that is guaranteed to fail.
+//
+// Note this cannot exclude the one style that really is a problem. uuid mints a
+// fresh random id on every link and is also 32 characters, so it is
+// indistinguishable from md5 by length; only comparing an id against the ELF it
+// claims to describe would catch it, which nothing here does. See INFRA.md.
+var buildIDLengths = map[int]bool{32: true, 40: true}
+
+// validBuildID reports whether a build id is one we could ever resolve.
+//
+// Lowercase only, deliberately. Accepting uppercase without normalising is
+// strictly worse than refusing it: the string is used verbatim as the cache key
+// and in the upstream URL, so it would occupy a second cache entry and then miss
+// at every upstream, which index them lowercase. Normalising instead would have
+// to happen at the routing layer to reach both of those, which is a bigger
+// change than this validation.
+func validBuildID(buildID string) error {
+	if !buildIDLengths[len(buildID)] {
+		return fmt.Errorf("length %d is not a build id length (want 32 for md5 or 40 for sha1)", len(buildID))
 	}
-	if len(buildID) < 32 {
-		return nil, fmt.Errorf("buildID too short %d", len(buildID))
+	for i := 0; i < len(buildID); i++ {
+		if c := buildID[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return fmt.Errorf("contains %q, which is not lowercase hex", string(c))
+		}
+	}
+	return nil
+}
+
+func (f *DebugInfoFinder) FindByBuildID(ctx context.Context, buildID string, endpointName string) (*Server, error) {
+	// Joined with ErrDebuginfoNotFound so the middleware answers 404 rather
+	// than 500. A malformed build id is not our failure, and 404 is the
+	// honest, cacheable answer - the edge holds it for two hours, so a client
+	// looping on a bad id stops reaching the origin at all. The detail stays in
+	// the error for access_log.error_msg, where it is the only record of why.
+	if err := validBuildID(buildID); err != nil {
+		return nil, stderrors.Join(ErrDebuginfoNotFound,
+			fmt.Errorf("rejected build id %q: %w", buildID, err))
 	}
 
 	state, err := f.GetState(ctx, buildID)

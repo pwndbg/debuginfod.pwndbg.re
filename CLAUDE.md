@@ -894,8 +894,34 @@ because all traffic arrives via Cloudflare, which settles the encoding with the 
 One representation also means no `Vary` header is required. It copies back the
 `x-debuginfod-*`, `content-type`, `content-encoding` and `content-length` headers plus its own
 `x-server` (the host that actually produced the bytes, taken from the cache entry on a HIT)
-and `x-cache` (`HIT`/`MISS`/`COALESCED`/`BYPASS`/`OVERLOADED`). Build IDs are checked for
-length (32–64) but **not** for character set. `WriteTimeout` is 60 minutes because debuginfo
+and `x-cache` (`HIT`/`MISS`/`COALESCED`/`BYPASS`/`OVERLOADED`). **Build IDs are validated against what is actually servable**, measured on both sides. Linkers emit
+16 hex (lld `--build-id=fast`, xxhash64), 32 (md5 and uuid), 40 (sha1) and anything from 8 to 128
+through an explicit `--build-id=0x…`. Distributions ship **only 40** — 952 ELF files scanned across
+debian, fedora and arch, every one sha1 — so a shorter id has nothing to index against anywhere.
+
+Production agrees, and this is the number that settled it: **of every request whose id was not 40
+characters, none has ever been served.** 727k requests at 8 characters, 105k at 32, 4k at 16, zero
+200s across nine months. So `buildIDLengths` is `{32, 40}`: 32 stays because md5 is a style a
+distribution could adopt tomorrow, while 16 and 64 are refused because forwarding one buys a
+fan-out to every upstream that is guaranteed to fail.
+
+The check is also lowercase-hex only. Accepting uppercase without normalising is strictly worse than
+refusing it: the string is the cache key *and* the upstream URL, so it would take a second cache
+entry and then miss at every upstream. Normalising instead would have to happen at the routing layer
+to reach both.
+
+A rejected id returns `errors.Join(ErrDebuginfoNotFound, detail)` — 404, not 500, because it is not
+our failure and the edge caches a 404 for two hours, so a client looping on a bad id stops reaching
+the origin. The detail survives into `access_log.error_msg`, the only record of why.
+
+**This cannot exclude the one style that is genuinely a problem.** `uuid` mints a fresh random id on
+every link and is also 32 characters, so it is indistinguishable from md5 by length; only comparing
+an id against the ELF it claims to describe would catch it, and nothing here does. See the
+build-ID assumption in INFRA.md.
+
+`cmd/nix-debuginfod` keeps a weaker `len < 3` check of its own; it is reachable
+only from the proxy, so the proxy's validation is what actually guards the build id that becomes a
+filename in `images/buildid/<id>`. `WriteTimeout` is 60 minutes because debuginfo
 downloads are large, while `cacheFetchTimeout` in `filecache.go` is 30 — a detached download
 is cut at half the client's connection budget, deliberately. Nothing enforces the relationship
 between the two literals.

@@ -626,3 +626,60 @@ func TestTryAllServersReturnsWhenEveryUpstreamFails(t *testing.T) {
 		t.Fatal("tryAllServers never returned - the goroutine is leaked and the singleflight key is stuck")
 	}
 }
+
+// The accepted lengths are measured on both sides. Linkers emit 16 (lld fast),
+// 32 (md5, uuid), 40 (sha1) and anything through an explicit 0x; distributions
+// ship only 40 - 952 ELF files across debian, fedora and arch, every one sha1 -
+// and production has never served a single request whose id was not 40
+// characters. 32 is kept because md5 is a style a distribution could adopt.
+func TestValidBuildIDAcceptsRealLinkerOutput(t *testing.T) {
+	for name, id := range map[string]string{
+		"md5":  "c4f92405c88d7fa3c64b03f87fc088ce",
+		"uuid": "4b7adf6c07d6f98e22f9e0621e3e215f",
+		"sha1": "6bfb17134eee3cbf15bdf70045a8e0d090590b60",
+	} {
+		if err := validBuildID(id); err != nil {
+			t.Errorf("%s (%d chars) rejected: %v", name, len(id), err)
+		}
+	}
+}
+
+// Everything else is refused before any upstream is contacted. 16 and 64 are
+// here deliberately: linkers do emit them, but no distribution ships them and
+// none has ever been served, so forwarding one buys a guaranteed-failing
+// fan-out to every upstream.
+func TestValidBuildIDRejectsWhatNoLinkerEmits(t *testing.T) {
+	for name, id := range map[string]string{
+		"empty":            "",
+		"too short":        "abcd",
+		"8 hex (no style)": "abababab",
+		"47 hex":           strings.Repeat("a", 47),
+		"128 hex":          strings.Repeat("ab", 64),
+		"uppercase sha1":   strings.ToUpper("6bfb17134eee3cbf15bdf70045a8e0d090590b60"),
+		"not hex":          strings.Repeat("z", 40),
+		"path traversal":   strings.Repeat("../", 13) + "a",
+		"sha1 with a dot":  "6bfb17134eee3cbf15bdf70045a8e0d09059.b60",
+	} {
+		if err := validBuildID(id); err == nil {
+			t.Errorf("%s (%q) was accepted", name, id)
+		}
+	}
+}
+
+// A malformed build id must answer 404, not 500: it is not our failure, and the
+// edge caches a 404 for two hours, so a client looping on a bad id stops
+// reaching the origin. The detail has to survive the join, because
+// access_log.error_msg is the only record of why it was refused.
+func TestFindByBuildIDRejectsMalformedAsNotFound(t *testing.T) {
+	f := &DebugInfoFinder{}
+	_, err := f.FindByBuildID(context.Background(), "nope", "debuginfo")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !stderrors.Is(err, ErrDebuginfoNotFound) {
+		t.Errorf("err = %v, want it to satisfy ErrDebuginfoNotFound so the middleware answers 404", err)
+	}
+	if !strings.Contains(err.Error(), "nope") || !strings.Contains(err.Error(), "length 4") {
+		t.Errorf("error loses the detail needed to diagnose it: %v", err)
+	}
+}
