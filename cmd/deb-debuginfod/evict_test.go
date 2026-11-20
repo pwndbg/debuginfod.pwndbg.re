@@ -18,6 +18,7 @@ type fakeUnpacker struct {
 	mu      sync.Mutex
 	trees   []tree
 	deleted []string
+	touched []string
 	failOn  map[string]bool
 }
 
@@ -28,6 +29,12 @@ func (f *fakeUnpacker) server(t *testing.T) *httptest.Server {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		json.NewEncoder(w).Encode(f.trees)
+	})
+	mux.HandleFunc("POST /touch/{component}/{name}", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.touched = append(f.touched, r.PathValue("component")+"/"+r.PathValue("name"))
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("DELETE /tree/{component}/{name}", func(w http.ResponseWriter, r *http.Request) {
 		key := r.PathValue("component") + "/" + r.PathValue("name")
@@ -167,5 +174,60 @@ func TestEvictLoopRefusesAZeroBudget(t *testing.T) {
 	s.EvictLoop(ctx, time.Millisecond, 0) // returns immediately
 	if got := f.gone(); len(got) != 0 {
 		t.Errorf("deleted %v with eviction disabled", got)
+	}
+}
+
+// The write-through is what keeps eviction ordering meaningful across a restart:
+// the map is empty on every start, and this service is redeployed far more often
+// than a 20 GiB budget fills.
+//
+// It has to go through the unpacker because the serving container mounts the
+// volume read-only - deliberately, so the single writer stays the single writer.
+func TestTouchIsWrittenThroughToTheUnpacker(t *testing.T) {
+	f := &fakeUnpacker{}
+	s := evictSrv(t, f)
+
+	s.touch(context.Background(), "main/glibc_1")
+
+	f.mu.Lock()
+	got := append([]string(nil), f.touched...)
+	f.mu.Unlock()
+	if len(got) != 1 || got[0] != "main/glibc_1" {
+		t.Fatalf("unpacker saw %v, want one touch of main/glibc_1", got)
+	}
+	if _, ok := s.lastUsed["main/glibc_1"]; !ok {
+		t.Error("the in-memory map was not updated")
+	}
+}
+
+// A round trip on every request would put the unpacker on the hot path for no
+// benefit: eviction orders by hours, not by milliseconds.
+func TestTouchIsThrottled(t *testing.T) {
+	f := &fakeUnpacker{}
+	s := evictSrv(t, f)
+
+	for range 5 {
+		s.touch(context.Background(), "main/glibc_1")
+	}
+
+	f.mu.Lock()
+	n := len(f.touched)
+	f.mu.Unlock()
+	if n != 1 {
+		t.Errorf("unpacker was called %d times for five requests, want 1", n)
+	}
+}
+
+// A failing or absent unpacker must not break serving: this is bookkeeping, and
+// losing it costs eviction ordering after the next restart, not correctness now.
+func TestTouchSurvivesAnUnreachableUnpacker(t *testing.T) {
+	f := &fakeUnpacker{}
+	s := evictSrv(t, f)
+	s.unpacker = "http://127.0.0.1:1" // nothing listens here
+
+	s.touch(context.Background(), "main/glibc_1")
+
+	if _, ok := s.lastUsed["main/glibc_1"]; !ok {
+		t.Error("a failed write-through lost the in-memory record too")
 	}
 }

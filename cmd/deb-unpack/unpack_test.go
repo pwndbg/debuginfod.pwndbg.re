@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -165,5 +167,62 @@ func TestSweepStaleReclaimsOnlyOldStagingDirs(t *testing.T) {
 	}
 	if _, err := os.Stat(young); err != nil {
 		t.Error("a young staging directory was deleted; it may belong to a live unpack")
+	}
+}
+
+// The serving side decides what was used; this side is the only one that can
+// write, because the serving container mounts the volume read-only. The mtime
+// it writes is exactly what /trees reports as Modified, so there is no second
+// timestamp to keep in step.
+func TestHandleTouchWritesMtimeAndRefusesBadKeys(t *testing.T) {
+	root := t.TempDir()
+	s := &server{root: root}
+	tree := filepath.Join(root, "main", "glibc_1")
+	if err := os.MkdirAll(tree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-90 * 24 * time.Hour)
+	if err := os.Chtimes(tree, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /touch/{component}/{name}", s.handleTouch)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	post := func(path string) int {
+		resp, err := srv.Client().Post(srv.URL+path, "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := post("/touch/main/glibc_1"); code != http.StatusNoContent {
+		t.Fatalf("touch returned %d", code)
+	}
+	info, err := os.Stat(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().After(old.Add(time.Hour)) {
+		t.Errorf("mtime not updated: still %v", info.ModTime())
+	}
+
+	// The key arrives from another service but still becomes a filesystem path,
+	// and "it is internal" is not a property the filesystem can check.
+	if code := post("/touch/..%2f..%2fetc/passwd"); code == http.StatusNoContent {
+		t.Error("a traversal in the component was accepted")
+	}
+	if code := post("/touch/nosuch/glibc_1"); code == http.StatusNoContent {
+		t.Error("an unknown component was accepted")
+	}
+
+	// A tree evicted between the decision and this call is not an error - the
+	// next request rebuilds it.
+	if code := post("/touch/main/gone_1"); code != http.StatusNoContent {
+		t.Errorf("touch of a missing tree returned %d, want 204", code)
 	}
 }

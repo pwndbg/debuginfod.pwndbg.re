@@ -18,13 +18,52 @@ type tree struct {
 	Modified time.Time `json:"modified"`
 }
 
-// touch records that a package was just used. Called on every served request,
-// which is what makes the eviction order reflect demand rather than the order
-// things happened to be unpacked in.
-func (s *srv) touch(key string) {
+// touchPersistInterval is how often a use is written through to the volume.
+// Hourly is far finer than eviction needs and keeps the round trip off the hot
+// path: the in-memory map answers every request, and only the first use in an
+// hour costs a call to the unpacker.
+const touchPersistInterval = time.Hour
+
+// touch records that a package was just used, in memory and on the volume.
+//
+// The write-through is what makes the ordering survive a restart. The map is
+// empty on every start, and this service is redeployed far more often than a
+// 20 GiB budget fills, so "no map" is the normal case rather than the
+// exception - without it, ordering falls back to when a tree was unpacked,
+// which cannot tell a package fetched once from one serving a debugger all week.
+//
+// It goes through the unpacker because the serving container mounts the volume
+// read-only, deliberately: the unpacker is the single writer, so a mistake here
+// cannot corrupt the cache. Same split as deletion - this side decides, that
+// side acts.
+func (s *srv) touch(ctx context.Context, key string) {
+	now := time.Now()
+
 	s.mu.Lock()
-	s.lastUsed[key] = time.Now()
+	last, seen := s.lastUsed[key]
+	if seen && now.Sub(last) < touchPersistInterval {
+		s.mu.Unlock()
+		return
+	}
+	s.lastUsed[key] = now
 	s.mu.Unlock()
+
+	// Bounded separately from the request: this is bookkeeping, and a slow
+	// unpacker must not hold up a response that is otherwise ready.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.unpacker+"/touch/"+key, nil)
+	if err != nil {
+		return
+	}
+	resp, err := s.hc.Do(req)
+	if err != nil {
+		// Not fatal: losing this costs eviction ordering after the next
+		// restart, not correctness now.
+		log.WithError(err).WithField("package", key).Debug("could not record last use on the volume")
+		return
+	}
+	resp.Body.Close()
 }
 
 // EvictLoop keeps the volume under budget.

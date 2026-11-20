@@ -183,7 +183,7 @@ func (s *srv) handleSource(w http.ResponseWriter, r *http.Request, ps httprouter
 	logger = logger.WithField("package", pkg.Source+"_"+pkg.Version)
 
 	key := pkg.Component + "/" + pkg.Source + "_" + pkg.Version
-	s.touch(key)
+	s.touch(r.Context(), key)
 
 	ix, err := s.indexFor(r.Context(), pkg)
 	if err != nil {

@@ -112,6 +112,7 @@ func main() {
 	mux.HandleFunc("POST /unpack", s.handleUnpack)
 	mux.HandleFunc("GET /trees", s.handleTrees)
 	mux.HandleFunc("DELETE /tree/{component}/{name}", s.handleDelete)
+	mux.HandleFunc("POST /touch/{component}/{name}", s.handleTouch)
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	srv := &http.Server{

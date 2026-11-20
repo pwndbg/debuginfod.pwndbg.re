@@ -103,6 +103,36 @@ func (s *server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleTouch records that a tree was just served, as its mtime.
+//
+// It goes through this service for the same reason deletion does: the serving
+// container mounts the volume read-only, so it cannot write. It decides (it is
+// the only one that sees traffic) and this acts.
+//
+// The mtime is what `/trees` already reports as Modified, so the write feeds
+// straight into the ordering the server was already using as its fallback -
+// there is no second timestamp to keep in step.
+func (s *server) handleTouch(w http.ResponseWriter, r *http.Request) {
+	component, name := r.PathValue("component"), r.PathValue("name")
+	if !safeKey(component, name) {
+		http.Error(w, "invalid key", http.StatusBadRequest)
+		return
+	}
+	path := filepath.Join(s.root, component, name)
+	now := time.Now()
+	if err := os.Chtimes(path, now, now); err != nil {
+		if os.IsNotExist(err) {
+			// Evicted between the server deciding to touch it and this call.
+			// Not an error: the next request rebuilds it.
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // safeKey re-checks the path components. They arrive from another service, but
 // they still become a filesystem path, and "it is internal" is not a property
 // the filesystem can verify.

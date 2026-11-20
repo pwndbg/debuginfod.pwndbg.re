@@ -45,7 +45,7 @@ normal case rather than the exception. Without the write-through, the fallback w
 "oldest download" rather than "least recently used", and an image fetched months ago and served
 daily would be evicted before one fetched yesterday and never touched
 (`TestLastUseSurvivesARestart`). So mtime here deliberately means **last used**, not "when built";
-nothing else reads it, since `buildOnce` only tests the file for existence.
+nothing else reads it, since `buildOnce` only tests the file for existence. `cmd/deb-debuginfod` does the same thing, through the unpacker — see below.
 
 `touch` is called from `Open`, not from `Ensure`: `Ensure` only runs on a cold path, so a store path
 that stays mounted and busy would otherwise look untouched and be evicted first — exactly backwards.
@@ -777,9 +777,15 @@ unpacker to act. Two orderings are load-bearing and have tests:
   invisible to `/trees` and so never evicted, but deleting an operator's directory is the worse of
   the two mistakes.
 
-Ordering is by last *request*, not mtime — mtime cannot tell a package fetched once from one serving
-a debugger all week — with mtime as the fallback for trees this process has never served, e.g. after
-a restart. A zero or negative budget **disables** eviction rather than emptying the volume, so a typo
+Ordering is by last *request*, and **the last request is written through to the tree's mtime**
+(`POST /touch/{component}/{name}` on the unpacker, throttled to once an hour per package). That
+write-through is what keeps the ordering meaningful across a restart: the in-memory map is empty on
+every start, and this service is redeployed far more often than a 20 GiB budget fills, so "no map"
+is the normal case rather than the exception — and the bare fallback, the time a tree was unpacked,
+cannot tell a package fetched once from one serving a debugger all week. It goes through the
+unpacker for the same reason deletion does: the serving container mounts the volume read-only, so
+the single writer stays the single writer. A failing unpacker is not fatal — losing the write costs
+eviction ordering after the next restart, not correctness now. A zero or negative budget **disables** eviction rather than emptying the volume, so a typo
 in the config does not delete everything on the first tick. Verified end to end: 297 MB on the
 volume, 200 MB budget, glibc evicted, 3.1 MB left, and the next request for it rebuilt in 2.1 s.
 
