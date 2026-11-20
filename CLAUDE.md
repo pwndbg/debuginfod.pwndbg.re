@@ -170,12 +170,10 @@ name (`nix`, `deb`, `deb-unpack`) tells an upstream operator which of our servic
 `cmd/proxy` keeps its own equivalent, `newUpstreamRequest`, which both `Fetch` and `Probe` go
 through for the same reason.
 
-**`buildcheck/` tests how the repository is assembled, not what it does.** It asks the toolchain
-what each Dockerfile's binary imports and fails if the Dockerfile does not `COPY` that package, and
-checks `sync.sh` sends it. That failure is remote-only — the image builds locally from the module
-cache and its `COPY` fails on the host — and it has happened twice, with `srcindex/` and
-`useragent/`. Both lists are explicit rather than globs, so adding a top-level package is a step
-that is easy to forget; this is what remembers.
+**Adding a top-level package is a three-place change.** Every Dockerfile whose binary imports it
+needs a `COPY`, and `sync.sh` has to send it — both lists are explicit, not globs. Forgetting either
+is a remote-only failure: the image builds locally from the module cache and its `COPY` fails on the
+host. It has happened twice, with `srcindex/` and `useragent/`. Nothing checks this; check by hand.
 
 Four small interfaces exist purely so tests can avoid ClickHouse: `accessLogger`
 (`context.go`), `stateStore` (`finder.go`), `statsSource` (`stats.go`) and `cacheStatStore`
