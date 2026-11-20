@@ -64,18 +64,9 @@ that stays mounted and busy would otherwise look untouched and be evicted first 
   one thing it did that singleflight does not, capping how many *distinct* paths build at once,
   came back as a semaphore in `buildOnce`: a bound, not a queue, because a queue would also have to
   answer what happens when it fills.
-- **`cmd/indexer`** — builds and has tests; **nothing serves from its output yet**. It walks
-  `astral-sh/python-build-standalone` releases and records which asset holds the debug info for a
-  given build ID, into `pbs_buildids` + `pbs_assets`. It exists because uv downloads the
-  **`install_only_stripped`** tarballs: those binaries keep `.note.gnu.build-id` — stripping does
-  not touch it — but carry no DWARF, and no distro debuginfod knows the IDs, since these are
-  astral's builds. The `install_only` asset of the same release has the same binaries unstripped,
-  at the same member paths, with the same IDs. Verified on 3.14.7+20260825: `python3.14` is
-  `64c83ec8…d750` in both, 32 MB stripped against 116 MB with `.debug_info`, and all 9 build IDs
-  agree across the two assets (`TestStrippedAndFullShareBuildIDs`, needs local tarballs).
-  It used to be a Debian `.deb` scratchpad; that direction was dropped because `debuginfod.debian.net`
-  already covers Debian debuginfo, and the one gap it does not cover — `/source/*` — is in `.dsc`
-  and `.orig.tar.xz`, not in a `.deb`.
+- **`cmd/indexer`** + **`cmd/index-debuginfod`** — build, have tests, verified end to end through
+  the proxy; deployed by `run.sh --index`. They serve build IDs **no distribution debuginfod has**;
+  see "Indexed archives" below.
 - **`cmd/deb-debuginfod`** + **`cmd/deb-unpack`** — build, have tests, verified end to end; **not
   deployed**. They serve `/buildid/<id>/source/*` for Debian build IDs and nothing else, because
   `debuginfod.debian.net` already does debuginfo and executable well but returns 404 for every
@@ -85,17 +76,17 @@ that stays mounted and busy would otherwise look untouched and be evicted first 
 - **`cmd/debug-nar`** — builds; a personal scratch harness for poking at erofs images, with most of
   `main` commented out and hardcoded `/root/.cache/...` paths.
 
-`cmd/proxy`, `cmd/releases`, `cmd/nix-nar-old` and `cmd/indexer` have tests; the other packages have
-none. Every package compiles, so `go test ./...` works — but prefer naming the suites, since the
+Most packages have tests. Every package compiles, so `go test ./...` works — but prefer naming the suites, since the
 whole-module run buys nothing:
 
 ```bash
-go test ./cmd/proxy ./cmd/releases ./cmd/nix-nar-old ./cmd/indexer -race   # ~5s, no external deps
+go test ./cmd/proxy ./cmd/releases ./cmd/indexer ./cmd/index-debuginfod ./pkgarchive -race   # no external deps
 ```
 
 `cmd/indexer`'s two heaviest tests are skipped unless pointed at local tarballs
 (`PBS_TEST_TARBALL`, `PBS_TEST_TARBALL_STRIPPED`) — the synthetic archives cannot catch a change in
-how the release pipeline lays assets out.
+how the release pipeline lays assets out. `pkgarchive`'s `TestRealDeb` likewise wants
+`PKGARCHIVE_TEST_DEB` pointing at a real `.deb`.
 
 **A build-ID note is not near the front of the file.** `BuildIDFromELF` streams forward and takes
 the stream length from the tar entry header, because python-build-standalone links its interpreters
@@ -174,6 +165,7 @@ through for the same reason.
 needs a `COPY`, and `sync.sh` has to send it — both lists are explicit, not globs. Forgetting either
 is a remote-only failure: the image builds locally from the module cache and its `COPY` fails on the
 host. It has happened twice, with `srcindex/` and `useragent/`. Nothing checks this; check by hand.
+The current set: `nix/`, `srcindex/`, `useragent/`, `pkgarchive/`.
 
 Four small interfaces exist purely so tests can avoid ClickHouse: `accessLogger`
 (`context.go`), `stateStore` (`finder.go`), `statsSource` (`stats.go`) and `cacheStatStore`
@@ -297,13 +289,27 @@ suppressed for 30m after the 1st failure, 1h after the 2nd, 2h after the 3rd, th
 `counter > 30` the build ID is refused permanently without any upstream traffic. Changing these
 constants changes the load profile against every upstream at once.
 
+**Except when the upstream set grew since the failures were counted** (`upstreamsChangedAt`).
+"Permanently" was right only while the set was fixed: a build ID that failed against the old set
+was refused without ever being put to the new one. Ubuntu's libc forced this — `ubuntu` was Down
+for months, its build IDs piled up failures, and adding `ubuntu-dbg` would have answered none of
+the ones people had asked for most. A failed state whose `updated_at` predates the constant gets
+one fresh resolution with the counter reset; its result is newer than the constant, so ordinary
+backoff resumes (`TestFailuresBeforeNewUpstreamsAreRetriedOnce`). **Bump it whenever an upstream is
+added or re-enabled, and never past the deploy that carries it**: a failure recorded between deploy
+and a future date would also predate it, so every request would fan out to every upstream until the
+clock caught up. **Nor a day before it**: set first to midnight, it left that day's failures under
+ordinary backoff — among them the very libc build IDs that prompted `ubuntu-dbg`, hit by users and by
+testing hours before the deploy — so they stayed 501 after it. Use the minute before the deploy.
+
 **Source handling**: `Server.SourceAvailable` marks upstreams that serve `/source/*`. Debian and
 Ubuntu are 0 and hand sources to delegates (`debian-src`, `ubuntu-src`) instead. For the `source` endpoint the finder converts both "not found" and
 "host has no sources" into `ErrSourceNotImplemented` → HTTP 501, deliberately so results stay
 cacheable per build ID.
 
 **Upstreams** are a hardcoded map in `NewDebugInfoFinder`. Current set: systemtap, opensuse, fedora,
-archlinux, artixlinux, cachyos, centos, debian, ubuntu, and `nix` at `http://127.0.0.1:8032`.
+archlinux, artixlinux, cachyos, centos, debian, ubuntu, `nix` at `https://127.0.0.1:8034`, and
+`ubuntu-dbg` / `uv-python` at `http://127.0.0.1:8039/{ubuntu,pbs}` (one `cmd/index-debuginfod`).
 `elfutils` (bugged) and `alpine` (offline) are commented out — keep them commented rather than
 deleting, they document why. A host name persisted in `buildid_state` that no longer exists in this
 map degrades to a 404 with a warning log.
@@ -868,6 +874,99 @@ Two consequences that were not obvious:
   after unpacking a package — seconds, or minutes for a large one. A remote delegate would be cut
   off at the 5 s limit on every cold package. The same test pins it.
 
+### Indexed archives (`cmd/indexer` + `cmd/index-debuginfod`)
+
+For build IDs **no distribution debuginfod has**, so nothing upstream can be asked and we keep the
+build ID → archive mapping ourselves. Two sources, both gaps measured:
+
+- **`ubuntu`: Ubuntu's `libc6-dbg`.** Ubuntu ships `libc.so.6` and `ld-linux` debug info in
+  `libc6-dbg`, an ordinary `.deb` in the archive; `libc6-dbgsym` exists only for 16.04.
+  `debuginfod.ubuntu.com` indexes `ddebs.ubuntu.com` only, so it 404s the libc of every Ubuntu
+  since 18.04: of the build IDs in `libc6-dbg` 2.43-2ubuntu2, 2.39-0ubuntu8.12 and 2.35-0ubuntu3.18
+  (28, 273, 292) it knew **none**. Debian is fine — `debuginfod.debian.net` indexes its `libc6-dbg`.
+  `-ubuntu-packages` takes `component/source/binary` so another such package is a flag, not code.
+- **`pbs`: python-build-standalone**, where uv gets its Pythons. uv installs
+  **`install_only_stripped`**: the binaries keep `.note.gnu.build-id` but carry no DWARF, and no
+  distro knows the IDs. The `install_only` asset of the same release has the same binaries
+  unstripped, at the same paths, with the same IDs — verified on 3.14.7+20260825 and again on
+  3.11.18+20261110 aarch64 (`python3.11` `787059af…`, 22 MB stripped, 56 MB served with
+  `debug_info`). Served for `executable` too, since it is the unstripped binary. Indexed only
+  from 20260825, the first release with build IDs at all — see below.
+
+How it fits together:
+
+- **`cmd/indexer`** lists archives (the Ubuntu pool directory; Launchpad's `getPublishedBinaries`
+  with `-ubuntu-history`; GitHub releases),
+  streams each one once and records every ELF's build ID into `indexed_buildids`.
+  `indexed_archives` is the resume log keyed on url — both sources publish immutable, versioned
+  names — so a 6-hourly run downloads only what is new. A 404 is logged as `errGone` and treated as
+  done, so an expired Launchpad file is not re-fetched every run.
+- **A run in steady state is two requests, measured**: the pool directory, and the
+  python-build-standalone tag names. Skipping downloads was not enough — re-listing assets is ten
+  API pages per release, ~130 requests a run for twelve releases and growing. So:
+  - tags come from `git/matching-refs/tags/<year>` (`TagsSince`): names only, one unpaginated
+    request per calendar year, since tags are `YYYYMMDD`;
+  - a release whose every selected asset is in the resume log is **closed** in `indexed_releases`
+    and never looked up again (`TestFinishedReleasesCostNothing`). Closing waits a day after
+    publishing, because assets of a big release upload over time and a release closed while still
+    filling in would keep its late assets unindexed for good; a failed asset keeps it open. The key
+    includes the sorted variant set, so adding a variant reopens everything;
+  - Launchpad history runs once per process start: after it every version is indexed, every pool
+    file also under its Launchpad url, and anything new reaches the pool first.
+- **The Launchpad history starts at 20.04** (`-ubuntu-since`). Unbounded it reaches back to 4.10
+  "warty" in 2004: 6,332 publishing records, 1,652 files over 566 versions, most of them from
+  releases nobody debugs and some older than the `.build-id` layout. From 20.04 it is 552 files
+  over 15 series, measured. One request for the series list gives each series' version and
+  `date_created`; the earliest of the kept ones goes to Launchpad as `created_since_date`, so the
+  older pages are never sent, and entries are also filtered by series name, because a date cut
+  still lets through updates to an older series published after the window opened
+  (`TestHistoryStartsAtTheFloorSeries`). Versions compare as numbers — as strings `4.10` sorts after
+  `20.04`. The pool listing is not filtered: a handful of files, all live.
+  A separate `.debug` file's build ID is read from the ELF note and falls back to its
+  `.build-id/xx/…` path; on all 19 amd64 `libc6-dbg` in the pool the two agree for every file.
+- **`cmd/index-debuginfod`** (8039) answers `/{source}/buildid/{id}/{debuginfo,executable}` by
+  looking the ID up, fetching the archive, streaming it to the member and streaming the member
+  out — nothing on disk; the proxy's file cache is the cache. The source prefix is why one process
+  appears as two upstreams: separate names on `/stats`, and a `SourceVia` for the Ubuntu one only.
+- **It answers probes with Early Hints**, like `cmd/nix-debuginfod`: a 103 with `x-status: 200`
+  right after the lookup. The proxy probes with a 5 s header budget and a python member can be
+  100 MB into its archive. A 103 commits nothing, so a dead mirror is still a 502, not a 200 with a
+  broken body (`TestProbeIsAnsweredBeforeTheArchiveArrives`). The cost: a probe's disconnect
+  cancels a download that has just started.
+- **`kind` guards `/executable`.** A separate `.debug` has NOBITS code sections, and served as an
+  executable it would disassemble as zeros (`TestSeparateDebugFileIsNeverAnExecutable`).
+- **Every Ubuntu row exists under two urls: the pool and Launchpad.** The pool drops a version the
+  moment the next update lands; Launchpad's `+files/` keeps every file the primary archive
+  published (2.35-0ubuntu3.1 from 2022 still resolves). A pool file is downloaded once and its
+  build IDs written twice (`Archive.Fallback`, `TestPoolFileIsRecordedUnderBothURLs`), so it stays
+  servable the hour it leaves the pool rather than after the next re-index. The server asks the
+  pool first — a mirror network, where the librarian is one service — and moves on after a 404.
+  Not snapshot.ubuntu.com: it is addressed by date and starts in 2023.
+- **Sources come free.** `x-debuginfod-archive` for an Ubuntu row is pool-shaped
+  (`/ubuntu/pool/main/g/glibc/libc6-dbg_2.43-2ubuntu2.7_amd64.deb`) whichever url it was fetched
+  from, which is exactly what `parseArchive` reads; the proxy records it in `buildid_state` and
+  `FetchFor` hands it to `ubuntu-src`. Pinned at both ends: `TestHeaderIsWhatDebDebuginfodParses`
+  and the `cmd/index-debuginfod` case in `TestParseArchive`.
+- Lookups are cached 10 min including misses — every cold build ID probes this service twice, so
+  most lookups are misses — but never on error, so a ClickHouse blip is not ten minutes of 404s.
+- The release list endpoint is used only without `-since`, and paged by 10, not 100: each release
+  inlines several hundred assets and a page of 100 came back 504.
+- `pkgarchive/` reads `.deb` (hand-rolled `ar`, then `data.tar.{zst,xz,gz}`) and `.tar.{gz,zst,xz}`
+  as a stream. No rpm: Fedora, openSUSE and CentOS index their own.
+
+`run.sh --index` starts both from one image; the indexer runs `-every 6h -ubuntu-history` and needs
+`GITHUB_TOKEN` in the deploying shell (60 requests an hour without one).
+
+**python-build-standalone is indexed from 20260825 on, and nothing older** (`-since`,
+`firstReleaseWithBuildIDs`). Before
+[#1230](https://github.com/astral-sh/python-build-standalone/pull/1230) ("Emit GNU build IDs on
+Linux targets", merged 2026-08-25) the Linux builds had no `.note.gnu.build-id`, so no debugger
+could ever ask for them by ID; 20260825 is the first release containing it. The one exception —
+aarch64 had IDs up to 20250630 while it was cross-compiled — is deliberately not chased. Each
+release is ~150 Linux `install_only` assets, 90 regular plus 60 `freethreaded-install_only` (uv's
+3.13t/3.14t), ~9–10 GiB; the first run therefore downloads roughly 110 GiB for the twelve releases
+since the floor, once — the resume log makes every later run cost only what is new.
+
 ### ClickHouse tables
 
 Created by `db.Init()` in each service.
@@ -896,11 +995,13 @@ Created by `db.Init()` in each service.
   (`st_blocks`) alongside apparent bytes, bytes tied up in abandoned `.tmp-*`, plus partition
   size and free space from `statfs`
 - `nix_access_log` — created by `cmd/nix-debuginfod` only.
-- `pbs_buildids`, `pbs_assets` — created and written by `cmd/indexer` only; nothing reads them yet.
-  `pbs_buildids` is build ID → (release asset, member path); `pbs_assets` is the resume log, keyed
-  on the asset's compressed size, since a published release asset is immutable. Neither has ever
-  existed in production, so both are still initial schema and carry no `ALTER` — that stops being
-  true on the first run against the real instance.
+- `indexed_releases` — python-build-standalone releases `cmd/indexer` has finished and will not
+  list again; see "Indexed archives".
+- `indexed_buildids`, `indexed_archives` — created and written by `cmd/indexer`, read by
+  `cmd/index-debuginfod`. `indexed_buildids` is build ID → (archive url, format, member, kind,
+  x-debuginfod-archive); `indexed_archives` is the resume log, keyed on url. Neither existed in
+  production before the first `run.sh --index`, so both are still initial schema and carry no
+  `ALTER` — any column added after that needs one.
 
 Access-log and stats inserts use `PrepareBatch` with `clickhouse.WithStdAsync(false)`; state updates
 use `AsyncInsert`. DB calls take a 5s timeout (60s for source indexing).

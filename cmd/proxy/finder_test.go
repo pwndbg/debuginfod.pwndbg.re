@@ -20,6 +20,8 @@ func finderWith(t *testing.T, store stateStore, names []string, handler func(nam
 	hits := &atomic.Int64{}
 	f := NewDebugInfoFinder(store)
 	f.servers = map[string]*Server{}
+	// The production date describes the production map, which this replaces.
+	f.upstreamsChangedAt = time.Time{}
 	for _, name := range names {
 		name := name
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -204,6 +206,35 @@ func TestBackoffWindows(t *testing.T) {
 					got, hits.Load(), tc.wantUpstrem)
 			}
 		})
+	}
+}
+
+// A failure recorded before an upstream was added says nothing about that
+// upstream, so it must not keep the build id from being put to it - not even
+// past the permanent cut-off. Ubuntu's libc is why: its build ids failed for
+// months while ubuntu was Down, and ubuntu-dbg would otherwise never be asked.
+func TestFailuresBeforeNewUpstreamsAreRetriedOnce(t *testing.T) {
+	store := newFakeStore()
+	store.put(BuildIDState{BuildID: testBuildID, Counter: 31, UpdatedAt: time.Now().Add(-48 * time.Hour)})
+	f, hits := finderWith(t, store, []string{"a", "b"}, respondNotFound)
+	f.upstreamsChangedAt = time.Now().Add(-time.Hour)
+
+	f.FindByBuildID(context.Background(), testBuildID, "debuginfo")
+	if hits.Load() == 0 {
+		t.Fatal("a failure from before the upstream set changed still blocked resolution")
+	}
+	st, _ := store.get(testBuildID)
+	if st.Counter != 1 {
+		t.Fatalf("counter after the fresh failure = %d, want 1: the old count must not carry over", st.Counter)
+	}
+
+	// The retry's own failure postdates the change, so ordinary backoff applies
+	// again. Without that, every request would fan out to every upstream.
+	before := hits.Load()
+	f.cache.Purge()
+	f.FindByBuildID(context.Background(), testBuildID, "debuginfo")
+	if hits.Load() != before {
+		t.Fatal("a fresh failure was retried immediately; the reset must happen once")
 	}
 }
 

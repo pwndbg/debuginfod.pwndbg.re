@@ -17,6 +17,7 @@ import (
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -60,6 +61,10 @@ type DebugInfoFinder struct {
 	cache *expirable.LRU[string, BuildIDState]
 	db    stateStore
 
+	// upstreamsChangedAt: failures recorded before it were measured against a
+	// different set of upstreams. See the constant of the same name.
+	upstreamsChangedAt time.Time
+
 	// sf collapses concurrent resolutions of the same build ID into one run.
 	// Without it, N parallel requests for one build ID mean N*len(servers)
 	// requests to upstreams.
@@ -67,6 +72,32 @@ type DebugInfoFinder struct {
 }
 
 const maxResolutionTimeout = 5 * time.Second
+
+// upstreamsChangedAt is when the servers map last GAINED an upstream. Bump it
+// whenever one is added or re-enabled.
+//
+// The negative backoff counts failures, and past 30 it stops asking anyone -
+// for good. That is right while the set of upstreams is fixed, and wrong the
+// moment it grows: a build id that failed against the old set is refused
+// without ever being put to the new one. Ubuntu's libc is the case that forced
+// this - ubuntu was Down for months, so its build ids piled up failures, and
+// adding ubuntu-dbg would have answered none of the ones people had asked for
+// most.
+//
+// A failure older than this is therefore not counted: the build id gets one
+// fresh resolution, and the backoff starts again from that result.
+//
+// It must not be later than the deploy that carries it. A failure recorded
+// after deploy but before this instant would also predate it - and so would the
+// retry's own failure, so every request would fan out to every upstream until
+// the clock caught up.
+//
+// Nor should it be much EARLIER than that deploy, which is the mistake made
+// first: set to midnight, it left every failure from that day's morning and
+// afternoon under ordinary backoff - including the very libc build ids that
+// prompted ubuntu-dbg, which users and testing had hit hours before the deploy.
+// Use the minute before the deploy, not the day.
+var upstreamsChangedAt = time.Date(2026, 11, 20, 17, 32, 0, 0, time.UTC)
 
 // responseHeaderTimeout caps the time from sending the request to receiving the
 // response headers. It guards against an upstream that accepts the connection and
@@ -205,8 +236,23 @@ func NewDebugInfoFinder(db stateStore) *DebugInfoFinder {
 			// proxy keeps open across many build IDs. cmd/nix-nar-old is the
 			// plain-HTTP one on 8032.
 			"nix": {Name: "nix", Down: false, SourceAvailable: 1, URL: "https://127.0.0.1:8034"},
+			// cmd/index-debuginfod: build ids no distribution debuginfod has,
+			// from the index cmd/indexer keeps. One process, two upstreams, so
+			// each shows up on /stats under its own name and only the Ubuntu one
+			// hands sources on.
+			//
+			// ubuntu-dbg: Ubuntu ships libc's debug info in libc6-dbg, a plain
+			// .deb, and debuginfod.ubuntu.com indexes only ddebs - so libc.so.6
+			// and ld.so of every Ubuntu since 18.04 are a 404 there. The archive
+			// it reports is pool-shaped, which is what ubuntu-src parses.
+			"ubuntu-dbg": {Name: "ubuntu-dbg", Down: false, SourceAvailable: 0, URL: "http://127.0.0.1:8039/ubuntu", SourceVia: "ubuntu-src"},
+			// uv-python: python-build-standalone, where uv gets its Pythons. uv
+			// installs stripped builds; the index points at the unstripped
+			// install_only asset of the same release, which has the same ids.
+			"uv-python": {Name: "uv-python", Down: false, SourceAvailable: 0, URL: "http://127.0.0.1:8039/pbs"},
 		},
-		cache: expirable.NewLRU[string, BuildIDState](10000, nil, time.Hour*24),
+		upstreamsChangedAt: upstreamsChangedAt,
+		cache:              expirable.NewLRU[string, BuildIDState](10000, nil, time.Hour*24),
 	}
 }
 
@@ -666,6 +712,26 @@ func (f *DebugInfoFinder) applySourceRules(endpointName string, server *Server, 
 	return server, err
 }
 
+// backoffAllows reports whether a build id that has failed before may be put to
+// the upstreams again yet.
+func (f *DebugInfoFinder) backoffAllows(state BuildIDState, logger *logrus.Entry) bool {
+	if state.Counter > 30 {
+		logger.WithField("counter", state.Counter).Info("FindByBuildID skip find, counter to big")
+		return false
+	}
+	elapsed := time.Since(state.UpdatedAt)
+	switch state.Counter {
+	case 1:
+		return elapsed >= 30*time.Minute
+	case 2:
+		return elapsed >= 1*time.Hour
+	case 3:
+		return elapsed >= 2*time.Hour
+	default:
+		return elapsed >= 24*time.Hour
+	}
+}
+
 // bgFindByBuildID MUST be called only through f.sf.DoChan from FindByBuildID -
 // otherwise the stampede on upstreams returns for concurrent requests for the same
 // build ID.
@@ -692,29 +758,13 @@ func (f *DebugInfoFinder) bgFindByBuildID(buildID string) (*Server, error) {
 		return host, nil
 	}
 
-	if state.Counter > 30 {
-		logger.WithField("counter", state.Counter).Info("FindByBuildID skip find, counter to big")
+	if state.Counter > 0 && state.UpdatedAt.Before(f.upstreamsChangedAt) {
+		// Failures against a smaller set of upstreams say nothing about the
+		// current one; see upstreamsChangedAt.
+		logger.WithField("counter", state.Counter).Info("FindByBuildID retrying, failures predate the current upstreams")
+		state.Counter = 0
+	} else if !f.backoffAllows(state, logger) {
 		return nil, ErrDebuginfoNotFound
-	}
-
-	elapsed := time.Since(state.UpdatedAt)
-	switch state.Counter {
-	case 1:
-		if elapsed < 30*time.Minute {
-			return nil, ErrDebuginfoNotFound
-		}
-	case 2:
-		if elapsed < 1*time.Hour {
-			return nil, ErrDebuginfoNotFound
-		}
-	case 3:
-		if elapsed < 2*time.Hour {
-			return nil, ErrDebuginfoNotFound
-		}
-	default:
-		if elapsed < 24*time.Hour {
-			return nil, ErrDebuginfoNotFound
-		}
 	}
 
 	defer func() {
