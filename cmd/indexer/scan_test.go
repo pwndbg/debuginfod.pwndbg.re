@@ -4,8 +4,11 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -218,4 +221,27 @@ func TestStrippedAndFullShareBuildIDs(t *testing.T) {
 		t.Errorf("%d build ids unstripped, %d stripped", len(a), len(b))
 	}
 	t.Logf("%d build ids agree across both assets", len(b))
+}
+
+// Launchpad's librarian labels .gz files Content-Encoding: gzip whatever the
+// request asked for. Left to itself Go's transport decodes that away, and the
+// scan then reads a plain tar as the tar.gz Format promised - a failure on
+// every such archive, recorded in the resume log as a broken download.
+func TestScanArchiveReadsTheBytesAsStored(t *testing.T) {
+	const id = "64c83ec8756194b5e4d9107164d7c28a1f83d750"
+	body := tarGz(t, map[string][]byte{"python/bin/python3.14": elfWithID(t, id)})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	arts, err := ScanArchive(context.Background(), &http.Client{},
+		Archive{URL: srv.URL + "/a.tar.gz", Format: "tar.gz"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(arts) != 1 || arts[0].BuildID != id {
+		t.Fatalf("got %+v, want one artifact with %s", arts, id)
+	}
 }

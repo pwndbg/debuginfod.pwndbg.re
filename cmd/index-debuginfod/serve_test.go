@@ -296,3 +296,21 @@ func TestRoutes(t *testing.T) {
 		t.Fatalf("%d lookups for requests that cannot be in the index", n)
 	}
 }
+
+// Launchpad's librarian labels .gz files Content-Encoding: gzip whatever the
+// request asked for. Go's transport would decode that away, and the member
+// would then be looked for in a plain tar read as the tar.gz the index says.
+func TestArchiveIsReadAsStoredDespiteContentEncoding(t *testing.T) {
+	f := newFixture(t)
+	body := tarGz(t, map[string]string{"python/bin/python3.14": "\x7fELF-python"})
+	f.handle("/lp.tar.gz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write(body)
+	})
+	f.idx.rows["pbs/"+testID] = []entry{f.pythonEntry("/lp.tar.gz", 11)}
+
+	resp, got, err := get(t, f.proxy.URL+"/pbs/buildid/"+testID+"/executable")
+	if err != nil || resp.StatusCode != 200 || string(got) != "\x7fELF-python" {
+		t.Fatalf("%v %d %q", err, resp.StatusCode, got)
+	}
+}

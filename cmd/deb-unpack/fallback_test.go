@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
@@ -264,5 +266,33 @@ func TestUnpackStatusSaysWhoseFailureItWas(t *testing.T) {
 		if got := unpackStatus(err); got != tc.want {
 			t.Errorf("%s: status %d, want %d (err: %v)", name, got, tc.want, err)
 		}
+	}
+}
+
+// Launchpad's librarian serves a .diff.gz with Content-Encoding: gzip. Go's
+// transport, left to choose Accept-Encoding itself, decodes that away and the
+// file on disk is a plain diff - linux-hwe-7.0 7.0.0-38.38~24.04.4 then failed
+// in dpkg-source with "gunzip: not in gzip format". The file must be stored as
+// sent.
+func TestDownloadKeepsAGzipFileCompressed(t *testing.T) {
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	zw.Write([]byte("--- a\n+++ b\n"))
+	zw.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Encoding", "gzip") // regardless of what was asked, as the librarian does
+		w.Write(gz.Bytes())
+	}))
+	defer srv.Close()
+
+	s := &server{hc: &http.Client{}}
+	dst := filepath.Join(t.TempDir(), "x.diff.gz")
+	if err := s.download(context.Background(), srv.URL+"/x.diff.gz", dst); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, dst); got != gz.String() {
+		t.Fatalf("stored %d bytes starting %q, want the %d gzip bytes as sent", len(got), got[:min(len(got), 8)], gz.Len())
 	}
 }

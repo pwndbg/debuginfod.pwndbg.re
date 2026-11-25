@@ -38,6 +38,10 @@ func ScanArchive(ctx context.Context, hc *http.Client, a Archive) ([]Artifact, e
 	if err != nil {
 		return nil, err
 	}
+	// The archive's own bytes, never a transparently decoded copy: Launchpad's
+	// librarian sends .gz files with Content-Encoding: gzip, and Go's transport
+	// would strip the very compression a.Format says to expect.
+	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, err

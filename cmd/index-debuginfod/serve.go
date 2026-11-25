@@ -197,6 +197,9 @@ func (s *srv) serve(w http.ResponseWriter, r *http.Request, e entry) error {
 	if err != nil {
 		return err
 	}
+	// See ScanArchive in cmd/indexer: the format column describes the file as
+	// stored, so Go's transport must not decode a Content-Encoding: gzip away.
+	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := s.hc.Do(req)
 	if err != nil {
 		return err

@@ -265,11 +265,20 @@ func unpackStatus(err error) int {
 	return http.StatusInternalServerError
 }
 
+// download stores the file at url byte for byte.
+//
+// Accept-Encoding is set explicitly because Go's transport otherwise asks for
+// gzip itself and then transparently decompresses any response that carries
+// Content-Encoding: gzip. Launchpad's librarian labels a .diff.gz exactly that
+// way - even when asked for identity - so linux-hwe-7.0's diff.gz landed on disk
+// as a plain diff and dpkg-source failed with "gunzip: not in gzip format".
+// Setting the header ourselves turns the transparent decompression off.
 func (s *server) download(ctx context.Context, url, dst string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := s.hc.Do(req)
 	if err != nil {
 		return err

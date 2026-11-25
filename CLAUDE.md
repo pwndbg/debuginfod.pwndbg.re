@@ -839,6 +839,12 @@ the patching fixes.
     revision), so a tree is never assembled from two sources. An unknown `FALLBACK` value is fatal at
     startup rather than silently meaning "none".
   - Verified end to end: `hello 2.10-4` via snapshot, `coreutils 8.32-4.1ubuntu1.2` via Launchpad.
+  - **Every archive download sets `Accept-Encoding: identity`** (`deb-unpack`'s `download`, the
+    indexer's `ScanArchive`, `index-debuginfod`'s `serve`). Launchpad's librarian sends a `.diff.gz`
+    with `Content-Encoding: gzip` whatever was asked, and Go's transport — when it picked the header
+    itself — silently decodes it, so a plain diff landed on disk and `dpkg-source` failed with
+    "gunzip: not in gzip format" (linux-hwe-7.0, a 1.0-format package). Setting the header
+    explicitly is what turns the decoding off; the three tests mutated with it removed fail.
 
 `sync.sh` sends `srcindex/` and both Dockerfiles, and `run.sh --deb` builds and starts both pairs.
 Note `sync.sh` lists top-level packages **explicitly**, not by glob: forgetting one is a remote-only
